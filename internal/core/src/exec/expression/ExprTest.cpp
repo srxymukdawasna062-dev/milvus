@@ -32,6 +32,8 @@
 #include "common/Json.h"
 #include "common/JsonCastType.h"
 #include "common/Types.h"
+#include "common/Exception.h"
+#include "folly/CancellationToken.h"
 #include "gtest/gtest.h"
 #include "index/Meta.h"
 #include "index/JsonInvertedIndex.h"
@@ -12378,7 +12380,7 @@ TEST_P(ExprTest, TestTermWithJSON) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200) * 2);
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
     query::ExecPlanNodeVisitor visitor(*seg_promote, MAX_TIMESTAMP);
-    int offset = 0;
+
     for (auto [clause, ref_func, dtype] : testcases) {
         auto loc = serialized_expr_plan.find("@@@@@");
         auto expr_plan = serialized_expr_plan;
@@ -17395,6 +17397,85 @@ TEST_P(ExprTest, TestGISFunctionWithControlledData) {
                        });
 }
 
+TEST_P(ExprTest, TestSTIsValidFunction) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    auto schema = std::make_shared<Schema>();
+    auto int_fid = schema->AddDebugField("int", DataType::INT64);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto geom_fid = schema->AddDebugField("geometry", DataType::GEOMETRY);
+    schema->set_primary_field_id(int_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 100;
+    int num_iters = 1;
+
+    std::vector<const char*> wkts = {
+        "POINT (0 0)",                          // valid
+        "LINESTRING (0 0, 1 1, 2 2)",           // valid
+        "POLYGON ((0 0, 2 2, 2 0, 0 2, 0 0))",  // invalid
+        "LINESTRING (0 0, 0 0)"                 // invalid
+    };
+    std::vector<bool> expected_flags = {true, true, false, false};
+
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+
+        milvus::proto::schema::FieldData* geometry_field_data = nullptr;
+        for (auto& fd : *raw_data.raw_->mutable_fields_data()) {
+            if (fd.field_id() == geom_fid.get()) {
+                geometry_field_data = &fd;
+                break;
+            }
+        }
+        ASSERT_NE(geometry_field_data, nullptr);
+
+        geometry_field_data->mutable_scalars()
+            ->mutable_geometry_data()
+            ->clear_data();
+
+        auto ctx = GEOS_init_r();
+        for (int i = 0; i < N; ++i) {
+            const char* wkt = wkts[i % wkts.size()];
+            Geometry geom(ctx, wkt);
+            geometry_field_data->mutable_scalars()
+                ->mutable_geometry_data()
+                ->add_data(geom.to_wkb_string());
+        }
+        GEOS_finish_r(ctx);
+
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentInternalInterface*>(seg.get());
+
+    auto is_valid_expr = std::make_shared<milvus::expr::GISFunctionFilterExpr>(
+        milvus::expr::ColumnInfo(geom_fid, DataType::GEOMETRY),
+        proto::plan::GISFunctionFilterExpr_GISOp_STIsValid,
+        "");
+    auto plan = std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID,
+                                                       is_valid_expr);
+
+    BitsetType final =
+        ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
+
+    ASSERT_EQ(final.size(), N * num_iters);
+
+    for (int i = 0; i < final.size(); ++i) {
+        bool expected = expected_flags[i % expected_flags.size()];
+        EXPECT_EQ(final[i], expected)
+            << "Unexpected validity result at index " << i;
+    }
+}
+
 TEST_P(ExprTest, TestSTDWithinFunction) {
     using namespace milvus;
     using namespace milvus::query;
@@ -17653,4 +17734,103 @@ TEST(ExprTest, ParseGISFunctionFilterExprsMultipleOps) {
         auto sr = seg->Search(plan.get(), ph_grp.get(), MAX_TIMESTAMP);
         EXPECT_EQ(sr->total_nq_, 5) << "Failed for operation: " << op;
     }
+}
+
+TEST_P(ExprTest, TestCancellationInExprEval) {
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto int64_fid = schema->AddDebugField("counter", DataType::INT64);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    auto raw_data = DataGen(schema, N);
+    seg->PreInsert(N);
+    seg->Insert(0,
+                N,
+                raw_data.row_ids_.data(),
+                raw_data.timestamps_.data(),
+                raw_data.raw_);
+
+    // Test cancellation during expression evaluation
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+
+    // Create a cancellation source and token
+    folly::CancellationSource cancellation_source;
+    auto cancellation_token = cancellation_source.getToken();
+
+    // Create a query that will be cancelled
+    std::string serialized_expr_plan = R"(vector_anns: <
+                                              field_id: 100
+                                              predicates: <
+                                                unary_range_expr: <
+                                                  column_info: <
+                                                    field_id: 101
+                                                    data_type: Int64
+                                                  >
+                                                  op: GreaterThan
+                                                  value: <
+                                                    int64_val: 500
+                                                  >
+                                                >
+                                              >
+                                              query_info: <
+                                                topk: 10
+                                                round_decimal: 3
+                                                metric_type: "L2"
+                                                search_params: "{\"nprobe\": 10}"
+                                              >
+                                              placeholder_tag: "$0"
+     >)";
+
+    // Request cancellation before executing
+    cancellation_source.requestCancellation();
+
+    // Try to execute query with cancelled token - should throw
+    query::ExecPlanNodeVisitor visitor(
+        *seg_promote, MAX_TIMESTAMP, cancellation_token);
+
+    auto proto = std::make_unique<proto::plan::PlanNode>();
+    auto ok = google::protobuf::TextFormat::ParseFromString(
+        serialized_expr_plan, proto.get());
+    ASSERT_TRUE(ok);
+    auto plan = CreateSearchPlanByExpr(schema,
+                                       proto->SerializeAsString().data(),
+                                       proto->SerializeAsString().size());
+
+    // This should throw ExecOperatorException (wrapping FutureCancellation) when visiting the plan
+    ASSERT_THROW({ auto result = visitor.get_moved_result(*plan->plan_node_); },
+                 milvus::ExecOperatorException);
+}
+
+TEST(ExprTest, TestCancellationHelper) {
+    // Test that checkCancellation does nothing when query_context is nullptr
+    ASSERT_NO_THROW(milvus::exec::checkCancellation(nullptr));
+
+    // Test with valid query_context but no op_context
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+
+    auto query_context = std::make_unique<milvus::exec::QueryContext>(
+        "test_query", seg_promote, 0, MAX_TIMESTAMP);
+
+    // Should not throw when op_context is nullptr
+    ASSERT_NO_THROW(milvus::exec::checkCancellation(query_context.get()));
+
+    // Test with cancelled token
+    folly::CancellationSource source;
+    milvus::OpContext op_context(source.getToken());
+    query_context->set_op_context(&op_context);
+
+    // Should not throw when not cancelled
+    ASSERT_NO_THROW(milvus::exec::checkCancellation(query_context.get()));
+
+    // Cancel and test
+    source.requestCancellation();
+    ASSERT_THROW(milvus::exec::checkCancellation(query_context.get()),
+                 folly::FutureCancellation);
 }

@@ -125,10 +125,11 @@ func (t *l0CompactionTask) QueryTaskOnWorker(cluster session.Cluster) {
 		PlanID: t.GetTaskProto().GetPlanID(),
 	})
 	if err != nil || result == nil {
-		if errors.Is(err, merr.ErrNodeNotFound) {
-			t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID))
-		}
 		log.Warn("l0CompactionTask failed to get compaction result", zap.Error(err))
+		err = t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID))
+		if err != nil {
+			log.Warn("update l0 compaction task meta failed", zap.Error(err))
+		}
 		return
 	}
 	switch result.GetState() {
@@ -301,6 +302,7 @@ func (t *l0CompactionTask) selectFlushedSegment() ([]*SegmentInfo, []*datapb.Com
 			CollectionID:        info.GetCollectionID(),
 			PartitionID:         info.GetPartitionID(),
 			IsSorted:            info.GetIsSorted(),
+			Manifest:            info.GetManifestPath(),
 		})
 	}
 
@@ -340,6 +342,7 @@ func (t *l0CompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, err
 			InsertChannel: segInfo.GetInsertChannel(),
 			Deltalogs:     segInfo.GetDeltalogs(),
 			IsSorted:      segInfo.GetIsSorted(),
+			Manifest:      segInfo.GetManifestPath(),
 		})
 		segments = append(segments, segInfo)
 	}

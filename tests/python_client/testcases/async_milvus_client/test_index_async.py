@@ -30,9 +30,8 @@ class TestAsyncMilvusClientIndexInvalid(TestMilvusClientV2Base):
     """ Test case of index interface """
 
     def teardown_method(self, method):
-        self.init_async_milvus_client()
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.async_milvus_client_wrap.close())
+        if self.async_milvus_client_wrap.async_milvus_client is not None:
+            asyncio.run(self.async_milvus_client_wrap.close())
         super().teardown_method(method)
 
     """
@@ -61,8 +60,7 @@ class TestAsyncMilvusClientIndexInvalid(TestMilvusClientV2Base):
         index_params = async_client.prepare_index_params()[0]
         index_params.add_index(field_name="vector")
         # 3. create index
-        error = {ct.err_code: 1100, ct.err_msg: f"Invalid collection name: {name}. the first character of a collection "
-                                                f"name must be an underscore or letter: invalid parameter"}
+        error = {ct.err_code: 1100, ct.err_msg: f"collection not found[database=default][collection={name}]"}
         await async_client.create_index(name, index_params,
                                         check_task=CheckTasks.err_res, 
                                         check_items=error)
@@ -89,8 +87,7 @@ class TestAsyncMilvusClientIndexInvalid(TestMilvusClientV2Base):
         index_params = async_client.prepare_index_params()[0]
         index_params.add_index(field_name="vector")
         # 3. create index
-        error = {ct.err_code: 1100, ct.err_msg: f"Invalid collection name: {name}. the length of a collection name "
-                                                f"must be less than 255 characters: invalid parameter"}
+        error = {ct.err_code: 1100, ct.err_msg: f"collection not found[database=default][collection={name}]"}
         await async_client.create_index(name, index_params,
                                         check_task=CheckTasks.err_res, 
                                         check_items=error)
@@ -118,7 +115,7 @@ class TestAsyncMilvusClientIndexInvalid(TestMilvusClientV2Base):
         index_params.add_index(field_name="vector")
         # 3. create index
         error = {ct.err_code: 100,
-                 ct.err_msg: f"can't find collection[database=default][collection={not_existed_collection_name}]"}
+                 ct.err_msg: f"collection not found[database=default][collection={not_existed_collection_name}]"}
         await async_client.create_index(not_existed_collection_name, index_params,
                                         check_task=CheckTasks.err_res, 
                                         check_items=error)
@@ -206,9 +203,8 @@ class TestAsyncMilvusClientIndexValid(TestMilvusClientV2Base):
     """ Test case of index interface """
 
     def teardown_method(self, method):
-        self.init_async_milvus_client()
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.async_milvus_client_wrap.close())
+        if self.async_milvus_client_wrap.async_milvus_client is not None:
+            asyncio.run(self.async_milvus_client_wrap.close())
         super().teardown_method(method)
 
     @pytest.fixture(scope="function", params=["COSINE", "L2", "IP"])

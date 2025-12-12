@@ -371,6 +371,72 @@ class TestMilvusClientUpsertInvalid(TestMilvusClientV2Base):
                     check_task=CheckTasks.err_res,
                     check_items=error)
 
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_client_upsert_duplicate_pk_int64(self):
+        """
+        target: test upsert with duplicate primary keys (Int64)
+        method:
+            1. create collection with Int64 primary key
+            2. upsert data with duplicate primary keys in the same batch
+        expected: raise error - duplicate primary keys are not allowed
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        # 1. create collection
+        self.create_collection(client, collection_name, default_dim, consistency_level="Strong")
+        # 2. upsert with duplicate PKs: 1, 2, 1 (duplicate)
+        rng = np.random.default_rng(seed=19530)
+        rows = [
+            {default_primary_key_field_name: 1, default_vector_field_name: list(rng.random((1, default_dim))[0]),
+             default_float_field_name: 1.0, default_string_field_name: "first"},
+            {default_primary_key_field_name: 2, default_vector_field_name: list(rng.random((1, default_dim))[0]),
+             default_float_field_name: 2.0, default_string_field_name: "second"},
+            {default_primary_key_field_name: 1, default_vector_field_name: list(rng.random((1, default_dim))[0]),
+             default_float_field_name: 1.1, default_string_field_name: "duplicate"},
+        ]
+        error = {ct.err_code: 1100,
+                 ct.err_msg: "duplicate primary keys are not allowed in the same batch"}
+        self.upsert(client, collection_name, rows,
+                    check_task=CheckTasks.err_res, check_items=error)
+        self.drop_collection(client, collection_name)
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_client_upsert_duplicate_pk_varchar(self):
+        """
+        target: test upsert with duplicate primary keys (VarChar)
+        method:
+            1. create collection with VarChar primary key
+            2. upsert data with duplicate primary keys in the same batch
+        expected: raise error - duplicate primary keys are not allowed
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        dim = default_dim
+        # 1. create collection with VarChar primary key
+        schema = self.create_schema(client, enable_dynamic_field=False)[0]
+        schema.add_field(default_primary_key_field_name, DataType.VARCHAR, max_length=64, is_primary=True,
+                         auto_id=False)
+        schema.add_field(default_vector_field_name, DataType.FLOAT_VECTOR, dim=dim)
+        schema.add_field(default_float_field_name, DataType.FLOAT)
+        index_params = self.prepare_index_params(client)[0]
+        index_params.add_index(default_vector_field_name, metric_type="COSINE")
+        self.create_collection(client, collection_name, dimension=dim, schema=schema, index_params=index_params)
+        # 2. upsert with duplicate PKs: "a", "b", "a" (duplicate)
+        rng = np.random.default_rng(seed=19530)
+        rows = [
+            {default_primary_key_field_name: "a", default_vector_field_name: list(rng.random((1, dim))[0]),
+             default_float_field_name: 1.0},
+            {default_primary_key_field_name: "b", default_vector_field_name: list(rng.random((1, dim))[0]),
+             default_float_field_name: 2.0},
+            {default_primary_key_field_name: "a", default_vector_field_name: list(rng.random((1, dim))[0]),
+             default_float_field_name: 1.1},
+        ]
+        error = {ct.err_code: 1100,
+                 ct.err_msg: "duplicate primary keys are not allowed in the same batch"}
+        self.upsert(client, collection_name, rows,
+                    check_task=CheckTasks.err_res, check_items=error)
+        self.drop_collection(client, collection_name)
+
 
 class TestMilvusClientUpsertValid(TestMilvusClientV2Base):
     """ Test case of search interface """

@@ -38,6 +38,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/metric"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -80,8 +81,8 @@ type searchTask struct {
 	translatedOutputFields []string
 	userOutputFields       []string
 	userDynamicFields      []string
-
-	resultBuf *typeutil.ConcurrentSet[*internalpb.SearchResults]
+	highlighter            Highlighter
+	resultBuf              *typeutil.ConcurrentSet[*internalpb.SearchResults]
 
 	partitionIDsSet *typeutil.ConcurrentSet[UniqueID]
 
@@ -291,7 +292,7 @@ func (t *searchTask) PreExecute(ctx context.Context) error {
 
 	timezone, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, t.request.SearchParams)
 	if exist {
-		if !funcutil.IsTimezoneValid(timezone) {
+		if !timestamptz.IsTimezoneValid(timezone) {
 			log.Info("get invalid timezone from request", zap.String("timezone", timezone))
 			return merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", timezone)
 		}
@@ -470,12 +471,13 @@ func (t *searchTask) initAdvancedSearchRequest(ctx context.Context) error {
 		}
 
 		// set analyzer name for sub search
-		analyzer, err := funcutil.GetAttrByKeyFromRepeatedKV("analyzer_name", subReq.GetSearchParams())
+		analyzer, err := funcutil.GetAttrByKeyFromRepeatedKV(AnalyzerKey, subReq.GetSearchParams())
 		if err == nil {
 			internalSubReq.AnalyzerName = analyzer
 		}
 
 		internalSubReq.FieldId = queryInfo.GetQueryFieldId()
+
 		queryFieldIDs = append(queryFieldIDs, internalSubReq.FieldId)
 		// set PartitionIDs for sub search
 		if t.partitionKeyMode {
@@ -562,6 +564,65 @@ func (t *searchTask) fillResult() {
 	t.result.CollectionName = t.collectionName
 }
 
+func (t *searchTask) getBM25SearchTexts(placeholder []byte) ([]string, error) {
+	pb := &commonpb.PlaceholderGroup{}
+	proto.Unmarshal(placeholder, pb)
+
+	if len(pb.Placeholders) != 1 || len(pb.Placeholders[0].Values) == 0 {
+		return nil, merr.WrapErrParameterInvalidMsg("please provide varchar/text for BM25 Function based search")
+	}
+
+	holder := pb.Placeholders[0]
+	if holder.Type != commonpb.PlaceholderType_VarChar {
+		return nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("please provide varchar/text for BM25 Function based search, got %s", holder.Type.String()))
+	}
+
+	texts := funcutil.GetVarCharFromPlaceholder(holder)
+	return texts, nil
+}
+
+func (t *searchTask) createLexicalHighlighter(highlighter *commonpb.Highlighter, metricType string, annsField int64, placeholder []byte, analyzerName string) error {
+	h, err := NewLexicalHighlighter(highlighter)
+	if err != nil {
+		return err
+	}
+	t.highlighter = h
+	if h.highlightSearch {
+		if metricType != metric.BM25 {
+			return merr.WrapErrParameterInvalidMsg(`Search highlight only support with metric type "BM25" but was: %s`, t.SearchRequest.GetMetricType())
+		}
+		function, ok := getBM25FunctionOfAnnsField(annsField, t.schema.GetFunctions())
+		if !ok {
+			return merr.WrapErrServiceInternal(`Search with highlight failed, input field of BM25 annsField not found`)
+		}
+		fieldId := function.InputFieldIds[0]
+		fieldName := function.InputFieldNames[0]
+		// set bm25 search text as highlight search texts
+		texts, err := t.getBM25SearchTexts(placeholder)
+		if err != nil {
+			return err
+		}
+		err = h.addTaskWithSearchText(fieldId, fieldName, analyzerName, texts)
+		if err != nil {
+			return err
+		}
+	}
+	return h.initHighlightQueries(t)
+}
+
+func (t *searchTask) addHighlightTask(highlighter *commonpb.Highlighter, metricType string, annsField int64, placeholder []byte, analyzerName string) error {
+	if highlighter == nil {
+		return nil
+	}
+
+	switch highlighter.GetType() {
+	case commonpb.HighlightType_Lexical:
+		return t.createLexicalHighlighter(highlighter, metricType, annsField, placeholder, analyzerName)
+	default:
+		return merr.WrapErrParameterInvalidMsg("unsupported highlight type: %v", highlighter.GetType())
+	}
+}
+
 func (t *searchTask) initSearchRequest(ctx context.Context) error {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "init search request")
 	defer sp.End()
@@ -584,9 +645,23 @@ func (t *searchTask) initSearchRequest(ctx context.Context) error {
 		}
 	}
 
+	analyzer, err := funcutil.GetAttrByKeyFromRepeatedKV(AnalyzerKey, t.request.GetSearchParams())
+	if err == nil {
+		t.SearchRequest.AnalyzerName = analyzer
+	}
+
 	t.isIterator = isIterator
 	t.SearchRequest.Offset = offset
 	t.SearchRequest.FieldId = queryInfo.GetQueryFieldId()
+
+	if err := t.addHighlightTask(t.request.GetHighlighter(), queryInfo.GetMetricType(), queryInfo.GetQueryFieldId(), t.request.GetPlaceholderGroup(), t.SearchRequest.GetAnalyzerName()); err != nil {
+		return err
+	}
+
+	// add highlight field ids to output fields id
+	if t.highlighter != nil {
+		t.SearchRequest.OutputFieldsId = append(t.SearchRequest.OutputFieldsId, t.highlighter.FieldIDs()...)
+	}
 
 	if t.partitionKeyMode {
 		// isolation has tighter constraint, check first
@@ -628,22 +703,15 @@ func (t *searchTask) initSearchRequest(ctx context.Context) error {
 		return err
 	}
 	if typeutil.IsFieldSparseFloatVector(t.schema.CollectionSchema, t.SearchRequest.FieldId) {
-		metrics.ProxySearchSparseNumNonZeros.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), t.collectionName, metrics.SearchLabel, strconv.FormatInt(t.SearchRequest.FieldId, 10)).Observe(float64(typeutil.EstimateSparseVectorNNZFromPlaceholderGroup(t.request.PlaceholderGroup, int(t.request.GetNq()))))
+		metrics.ProxySearchSparseNumNonZeros.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), t.collectionName, metrics.SearchLabel, strconv.FormatInt(t.SearchRequest.FieldId, 10)).Observe(float64(typeutil.EstimateSparseVectorNNZFromPlaceholderGroup(t.request.GetPlaceholderGroup(), int(t.request.GetNq()))))
 	}
-	t.SearchRequest.PlaceholderGroup = t.request.PlaceholderGroup
+	t.SearchRequest.PlaceholderGroup = t.request.GetPlaceholderGroup()
 	t.SearchRequest.Topk = queryInfo.GetTopk()
 	t.SearchRequest.MetricType = queryInfo.GetMetricType()
 	t.queryInfos = append(t.queryInfos, queryInfo)
 	t.SearchRequest.DslType = commonpb.DslType_BoolExprV1
 	t.SearchRequest.GroupByFieldId = queryInfo.GroupByFieldId
 	t.SearchRequest.GroupSize = queryInfo.GroupSize
-
-	if t.SearchRequest.MetricType == metric.BM25 {
-		analyzer, err := funcutil.GetAttrByKeyFromRepeatedKV("analyzer_name", t.request.GetSearchParams())
-		if err == nil {
-			t.SearchRequest.AnalyzerName = analyzer
-		}
-	}
 
 	if embedding.HasNonBM25Functions(t.schema.CollectionSchema.Functions, []int64{queryInfo.GetQueryFieldId()}) {
 		ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Search-call-function-udf")
@@ -819,7 +887,7 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 	t.isRecallEvaluation = isRecallEvaluation
 
 	// call pipeline
-	pipeline, err := newBuiltInPipeline(t)
+	pipeline, err := newSearchPipeline(t)
 	if err != nil {
 		log.Warn("Faild to create post process pipeline")
 		return err

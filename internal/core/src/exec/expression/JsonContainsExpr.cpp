@@ -242,6 +242,12 @@ PhyJsonContainsFilterExpr::ExecArrayContains(EvalCtx& context) {
             TargetBitmapView res,
             TargetBitmapView valid_res,
             const std::shared_ptr<MultiElement>& elements) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // We only need to update processed_cursor for bitmap_input indexing.
+        if (data == nullptr) {
+            processed_cursor += size;
+            return;
+        }
         auto executor = [&](size_t i) {
             const auto& array = data[i];
             for (int j = 0; j < array.length(); ++j) {
@@ -336,6 +342,12 @@ PhyJsonContainsFilterExpr::ExecJsonContains(EvalCtx& context) {
             TargetBitmapView valid_res,
             const std::string& pointer,
             const std::shared_ptr<MultiElement>& elements) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // We only need to update processed_cursor for bitmap_input indexing.
+        if (data == nullptr) {
+            processed_cursor += size;
+            return;
+        }
         auto executor = [&](size_t i) {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
@@ -508,9 +520,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsByStats() {
                 }
             }
         };
-        if (!index->CanSkipShared(pointer)) {
-            index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
-        }
+        index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
         cached_index_chunk_id_ = 0;
     }
 
@@ -544,11 +554,18 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArray(EvalCtx& context) {
     TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
 
     auto pointer = milvus::Json::pointer(expr_->column_.nested_path_);
-    std::vector<proto::plan::Array> elements;
-    for (auto const& element : expr_->vals_) {
-        elements.emplace_back(GetValueFromProto<proto::plan::Array>(element));
+    if (!arg_inited_) {
+        auto elements = std::make_shared<std::vector<proto::plan::Array>>();
+        for (auto const& element : expr_->vals_) {
+            elements->emplace_back(
+                GetValueFromProto<proto::plan::Array>(element));
+        }
+        arg_cached_set_ = elements;
+        arg_inited_ = true;
     }
 
+    auto elements = std::static_pointer_cast<std::vector<proto::plan::Array>>(
+        arg_cached_set_);
     size_t processed_cursor = 0;
     auto execute_sub_batch =
         [&processed_cursor, &
@@ -561,6 +578,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArray(EvalCtx& context) {
             TargetBitmapView valid_res,
             const std::string& pointer,
             const std::vector<proto::plan::Array>& elements) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // We only need to update processed_cursor for bitmap_input indexing.
+        if (data == nullptr) {
+            processed_cursor += size;
+            return;
+        }
         auto executor = [&](size_t i) -> bool {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
@@ -613,14 +636,14 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArray(EvalCtx& context) {
                                                             res,
                                                             valid_res,
                                                             pointer,
-                                                            elements);
+                                                            *elements);
     } else {
         processed_size = ProcessDataChunks<milvus::Json>(execute_sub_batch,
                                                          std::nullptr_t{},
                                                          res,
                                                          valid_res,
                                                          pointer,
-                                                         elements);
+                                                         *elements);
     }
     AssertInfo(processed_size == real_batch_size,
                "internal error: expr processed rows {} not equal "
@@ -702,9 +725,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArrayByStats() {
             }
             return false;
         };
-        if (!index->CanSkipShared(pointer)) {
-            index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
-        }
+        index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
         cached_index_chunk_id_ = 0;
     }
 
@@ -739,11 +760,17 @@ PhyJsonContainsFilterExpr::ExecArrayContainsAll(EvalCtx& context) {
     TargetBitmapView res(res_vec->GetRawData(), real_batch_size);
     TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
 
-    std::set<GetType> elements;
-    for (auto const& element : expr_->vals_) {
-        elements.insert(GetValueWithCastNumber<GetType>(element));
+    if (!arg_inited_) {
+        auto elements = std::make_shared<std::set<GetType>>();
+        for (auto const& element : expr_->vals_) {
+            elements->insert(GetValueWithCastNumber<GetType>(element));
+        }
+        arg_cached_set_ = elements;
+        arg_inited_ = true;
     }
 
+    auto elements =
+        std::static_pointer_cast<std::set<GetType>>(arg_cached_set_);
     int processed_cursor = 0;
     auto execute_sub_batch =
         [&processed_cursor, &
@@ -755,6 +782,12 @@ PhyJsonContainsFilterExpr::ExecArrayContainsAll(EvalCtx& context) {
             TargetBitmapView res,
             TargetBitmapView valid_res,
             const std::set<GetType>& elements) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // We only need to update processed_cursor for bitmap_input indexing.
+        if (data == nullptr) {
+            processed_cursor += size;
+            return;
+        }
         auto executor = [&](size_t i) {
             std::set<GetType> tmp_elements(elements);
             // Note: array can only be iterated once
@@ -791,10 +824,10 @@ PhyJsonContainsFilterExpr::ExecArrayContainsAll(EvalCtx& context) {
                                                     input,
                                                     res,
                                                     valid_res,
-                                                    elements);
+                                                    *elements);
     } else {
         processed_size = ProcessDataChunks<milvus::ArrayView>(
-            execute_sub_batch, std::nullptr_t{}, res, valid_res, elements);
+            execute_sub_batch, std::nullptr_t{}, res, valid_res, *elements);
     }
     AssertInfo(processed_size == real_batch_size,
                "internal error: expr processed rows {} not equal "
@@ -832,11 +865,17 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAll(EvalCtx& context) {
     TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
 
     auto pointer = milvus::Json::pointer(expr_->column_.nested_path_);
-    std::set<GetType> elements;
-    for (auto const& element : expr_->vals_) {
-        elements.insert(GetValueFromProto<GetType>(element));
+    if (!arg_inited_) {
+        auto elements = std::make_shared<std::set<GetType>>();
+        for (auto const& element : expr_->vals_) {
+            elements->insert(GetValueFromProto<GetType>(element));
+        }
+        arg_cached_set_ = elements;
+        arg_inited_ = true;
     }
 
+    auto elements =
+        std::static_pointer_cast<std::set<GetType>>(arg_cached_set_);
     int processed_cursor = 0;
     auto execute_sub_batch =
         [&processed_cursor, &
@@ -849,6 +888,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAll(EvalCtx& context) {
             TargetBitmapView valid_res,
             const std::string& pointer,
             const std::set<GetType>& elements) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // We only need to update processed_cursor for bitmap_input indexing.
+        if (data == nullptr) {
+            processed_cursor += size;
+            return;
+        }
         auto executor = [&](const size_t i) -> bool {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
@@ -907,14 +952,14 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAll(EvalCtx& context) {
                                                     res,
                                                     valid_res,
                                                     pointer,
-                                                    elements);
+                                                    *elements);
     } else {
         processed_size = ProcessDataChunks<Json>(execute_sub_batch,
                                                  std::nullptr_t{},
                                                  res,
                                                  valid_res,
                                                  pointer,
-                                                 elements);
+                                                 *elements);
     }
     AssertInfo(processed_size == real_batch_size,
                "internal error: expr processed rows {} not equal "
@@ -935,12 +980,19 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
     if (real_batch_size == 0) {
         return nullptr;
     }
-    std::set<GetType> elements;
     auto pointer = milvus::Json::pointer(expr_->column_.nested_path_);
-    for (auto const& element : expr_->vals_) {
-        elements.insert(GetValueFromProto<GetType>(element));
+    if (!arg_inited_) {
+        auto elements = std::make_shared<std::set<GetType>>();
+        for (auto const& element : expr_->vals_) {
+            elements->insert(GetValueFromProto<GetType>(element));
+        }
+        arg_cached_set_ = elements;
+        arg_inited_ = true;
     }
-    if (elements.empty()) {
+
+    auto elements =
+        std::static_pointer_cast<std::set<GetType>>(arg_cached_set_);
+    if (elements->empty()) {
         MoveCursor();
         return std::make_shared<ColumnVector>(
             TargetBitmap(real_batch_size, false),
@@ -966,7 +1018,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
                 pointer, milvus::index::JSONType::ARRAY);
             if (!target_field.empty()) {
                 ShreddingArrayBsonContainsAllExecutor<GetType> executor(
-                    elements);
+                    *elements);
 
                 index->ExecutorForShreddingData<std::string_view>(
                     op_ctx_,
@@ -989,7 +1041,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
                 return;
             }
 
-            std::set<GetType> tmp_elements(elements);
+            std::set<GetType> tmp_elements(*elements);
             for (const auto& element : val.value()) {
                 auto value = milvus::BsonView::GetValueFromBsonView<GetType>(
                     element.get_value());
@@ -1020,9 +1072,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
             }
             res_view[row_offset] = tmp_elements.empty();
         };
-        if (!index->CanSkipShared(pointer)) {
-            index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
-        }
+        index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
         cached_index_chunk_id_ = 0;
     }
 
@@ -1077,9 +1127,15 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffType(EvalCtx& context) {
             const std::string& pointer,
             const std::vector<proto::plan::GenericValue>& elements,
             const std::unordered_set<int> elements_index) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // We only need to update processed_cursor for bitmap_input indexing.
+        if (data == nullptr) {
+            processed_cursor += size;
+            return;
+        }
         auto executor = [&](size_t i) -> bool {
             const auto& json = data[i];
-            auto doc = json.doc();
+            auto doc = json.dom_doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
                 return false;
@@ -1351,9 +1407,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffTypeByStats() {
             }
             res_view[row_offset] = tmp_elements_index.size() == 0;
         };
-        if (!index->CanSkipShared(pointer)) {
-            index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
-        }
+        index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
         cached_index_chunk_id_ = 0;
     }
 
@@ -1405,6 +1459,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArray(EvalCtx& context) {
             TargetBitmapView valid_res,
             const std::string& pointer,
             const std::vector<proto::plan::Array>& elements) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // We only need to update processed_cursor for bitmap_input indexing.
+        if (data == nullptr) {
+            processed_cursor += size;
+            return;
+        }
         auto executor = [&](const size_t i) {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
@@ -1558,9 +1618,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArrayByStats() {
             res_view[row_offset] =
                 exist_elements_index.size() == elements.size();
         };
-        if (!index->CanSkipShared(pointer)) {
-            index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
-        }
+        index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
         cached_index_chunk_id_ = 0;
     }
 
@@ -1615,9 +1673,15 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffType(EvalCtx& context) {
             TargetBitmapView valid_res,
             const std::string& pointer,
             const std::vector<proto::plan::GenericValue>& elements) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // We only need to update processed_cursor for bitmap_input indexing.
+        if (data == nullptr) {
+            processed_cursor += size;
+            return;
+        }
         auto executor = [&](const size_t i) {
             auto& json = data[i];
-            auto doc = json.doc();
+            auto doc = json.dom_doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
                 return false;
@@ -1864,9 +1928,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffTypeByStats() {
                 }
             }
         };
-        if (!index->CanSkipShared(pointer)) {
-            index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
-        }
+        index->ExecuteForSharedData(op_ctx_, pointer, shared_executor);
         cached_index_chunk_id_ = 0;
     }
 

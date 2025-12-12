@@ -20,6 +20,9 @@ import (
 func newBroadcastTaskFromProto(proto *streamingpb.BroadcastTask, metrics *broadcasterMetrics, ackCallbackScheduler *ackCallbackScheduler) *broadcastTask {
 	msg := message.NewBroadcastMutableMessageBeforeAppend(proto.Message.Payload, proto.Message.Properties)
 	m := metrics.NewBroadcastTask(msg.MessageType(), proto.GetState(), msg.BroadcastHeader().ResourceKeys.Collect())
+
+	fixAckInfoFromProto(proto, len(msg.BroadcastHeader().VChannels))
+
 	bt := &broadcastTask{
 		mu:                   sync.Mutex{},
 		taskMetricsGuard:     m,
@@ -29,14 +32,33 @@ func newBroadcastTaskFromProto(proto *streamingpb.BroadcastTask, metrics *broadc
 		ackCallbackScheduler: ackCallbackScheduler,
 		done:                 make(chan struct{}),
 		allAcked:             make(chan struct{}),
+		allAckedClosed:       false,
 	}
 	if isAllDone(bt.task) {
-		close(bt.allAcked)
+		bt.closeAllAcked()
 	}
 	if proto.State == streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_TOMBSTONE {
 		close(bt.done)
 	}
 	return bt
+}
+
+// fixAckInfoFromProto fixes the recovery info of the broadcast task.
+// because the zero value of the repeated field and bytes field in proto is ignored or treated as empty value but not nil pointer,
+// so we need to fix the recovery info of the broadcast task from proto to keep the consistency of memory state.
+func fixAckInfoFromProto(proto *streamingpb.BroadcastTask, vchannelCount int) {
+	bitmap := make([]byte, vchannelCount)
+	copy(bitmap, proto.AckedVchannelBitmap)
+
+	checkpoints := make([]*streamingpb.AckedCheckpoint, vchannelCount)
+	for i, cp := range proto.AckedCheckpoints {
+		if cp != nil && cp.TimeTick == 0 {
+			cp = nil
+		}
+		checkpoints[i] = cp
+	}
+	proto.AckedVchannelBitmap = bitmap
+	proto.AckedCheckpoints = checkpoints
 }
 
 // newBroadcastTaskFromBroadcastMessage creates a new broadcast task from the broadcast message.
@@ -58,6 +80,7 @@ func newBroadcastTaskFromBroadcastMessage(msg message.BroadcastMutableMessage, m
 		ackCallbackScheduler: ackCallbackScheduler,
 		done:                 make(chan struct{}),
 		allAcked:             make(chan struct{}),
+		allAckedClosed:       false,
 	}
 	return bt
 }
@@ -83,6 +106,7 @@ type broadcastTask struct {
 	dirty                    bool // a flag to indicate that the task has been modified and needs to be saved into the recovery info.
 	done                     chan struct{}
 	allAcked                 chan struct{}
+	allAckedClosed           bool
 	guards                   *lockGuards
 	ackCallbackScheduler     *ackCallbackScheduler
 	joinAckCallbackScheduled bool // a flag to indicate that the join ack callback is scheduled.
@@ -248,9 +272,18 @@ func (b *broadcastTask) ack(ctx context.Context, msgs ...message.ImmutableMessag
 		b.joinAckCallbackScheduled = true
 	}
 	if allDone {
-		close(b.allAcked)
+		b.closeAllAcked()
 	}
 	return nil
+}
+
+// closeAllAcked closes the allAcked channel.
+func (b *broadcastTask) closeAllAcked() {
+	if b.allAckedClosed {
+		return
+	}
+	close(b.allAcked)
+	b.allAckedClosed = true
 }
 
 // hasControlChannel checks if the control channel is broadcasted.

@@ -28,9 +28,9 @@ import (
 	"github.com/milvus-io/milvus/internal/util/importutilv2/common"
 	"github.com/milvus-io/milvus/internal/util/nullutil"
 	pkgcommon "github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/parameterutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -189,6 +189,15 @@ func (r *rowParser) reconstructArrayForStructArray(structName string, subFieldsM
 			flatStructs[fieldName] = append(flatStructs[fieldName], value)
 		}
 	}
+
+	// struct list can be empty, len(structs) can be zero
+	// fill flatStructs with empty list for each sub field if len(structs) is zero
+	if len(structs) == 0 {
+		for subFieldName := range subFieldsMap {
+			flatStructs[subFieldName] = make([]any, 0)
+		}
+	}
+
 	return flatStructs, nil
 }
 
@@ -446,7 +455,7 @@ func (r *rowParser) parseEntity(field *schemapb.FieldSchema, obj string, useElem
 		}
 		return wkbValue, nil
 	case schemapb.DataType_Timestamptz:
-		tz, err := funcutil.ValidateAndReturnUnixMicroTz(obj, r.timezone)
+		tz, err := timestamptz.ValidateAndReturnUnixMicroTz(obj, r.timezone)
 		if err != nil {
 			return nil, err
 		}

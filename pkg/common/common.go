@@ -28,11 +28,9 @@ import (
 	"github.com/twpayne/go-geom/encoding/wkb"
 	"github.com/twpayne/go-geom/encoding/wkbcommon"
 	"github.com/twpayne/go-geom/encoding/wkt"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 // system field id:
@@ -248,8 +246,9 @@ const (
 	NamespaceEnabledKey        = "namespace.enabled"
 
 	// timezone releated
-	TimezoneKey          = "timezone"
-	AllowInsertAutoIDKey = "allow_insert_auto_id"
+	TimezoneKey             = "timezone"
+	AllowInsertAutoIDKey    = "allow_insert_auto_id"
+	DisableFuncRuntimeCheck = "disable_func_runtime_check"
 )
 
 const (
@@ -299,7 +298,6 @@ func GetIndexType(indexParams []*commonpb.KeyValuePair) string {
 			return param.Value
 		}
 	}
-	log.Warn("IndexType not found in indexParams")
 	return ""
 }
 
@@ -363,6 +361,19 @@ func IsPartitionKeyIsolationKvEnabled(kvs ...*commonpb.KeyValuePair) (bool, erro
 			val, err := strconv.ParseBool(strings.ToLower(kv.Value))
 			if err != nil {
 				return false, errors.Wrap(err, "failed to parse partition key isolation")
+			}
+			return val, nil
+		}
+	}
+	return false, nil
+}
+
+func IsDisableFuncRuntimeCheck(kvs ...*commonpb.KeyValuePair) (bool, error) {
+	for _, kv := range kvs {
+		if kv.Key == DisableFuncRuntimeCheck {
+			val, err := strconv.ParseBool(strings.ToLower(kv.Value))
+			if err != nil {
+				return false, errors.Wrap(err, "failed to parse disable_func_runtime_check param")
 			}
 			return val, nil
 		}
@@ -471,7 +482,6 @@ func GetCollectionLoadFields(schema *schemapb.CollectionSchema, skipDynamicField
 
 		v, err := ShouldFieldBeLoaded(field.GetTypeParams())
 		if err != nil {
-			log.Warn("type param parse skip load failed", zap.Error(err))
 			// if configuration cannot be parsed, ignore it and load field
 			return field.GetFieldID(), true
 		}
@@ -521,7 +531,6 @@ func GetReplicateEndTS(kvs []*commonpb.KeyValuePair) (uint64, bool) {
 		if kv.GetKey() == ReplicateEndTSKey {
 			ts, err := strconv.ParseUint(kv.GetValue(), 10, 64)
 			if err != nil {
-				log.Warn("parse replicate end ts failed", zap.Error(err), zap.Stack("stack"))
 				return 0, false
 			}
 			return ts, true
@@ -595,6 +604,31 @@ func IsAllowInsertAutoID(kvs ...*commonpb.KeyValuePair) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func GetInt64Value(kvs []*commonpb.KeyValuePair, key string) (result int64, parseErr error, exist bool) {
+	kv := lo.FindOrElse(kvs, nil, func(kv *commonpb.KeyValuePair) bool {
+		return kv.GetKey() == key
+	})
+	if kv == nil {
+		return 0, nil, false
+	}
+
+	result, err := strconv.ParseInt(kv.GetValue(), 10, 64)
+	if err != nil {
+		return 0, err, true
+	}
+	return result, nil, true
+}
+
+func GetStringValue(kvs []*commonpb.KeyValuePair, key string) (result string, exist bool) {
+	kv := lo.FindOrElse(kvs, nil, func(kv *commonpb.KeyValuePair) bool {
+		return kv.GetKey() == key
+	})
+	if kv == nil {
+		return "", false
+	}
+	return kv.GetValue(), true
 }
 
 func CheckNamespace(schema *schemapb.CollectionSchema, namespace *string) error {

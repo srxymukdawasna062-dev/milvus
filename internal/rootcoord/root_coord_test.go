@@ -47,6 +47,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/broadcast"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
+	mocktso "github.com/milvus-io/milvus/internal/tso/mocks"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
@@ -83,6 +84,8 @@ func initStreamingSystemAndCore(t *testing.T) *Core {
 	require.NoError(t, err)
 	testDB := newNameDb()
 	collID2Meta := make(map[typeutil.UniqueID]*model.Collection)
+	tso := mocktso.NewAllocator(t)
+	tso.EXPECT().GenerateTSO(mock.Anything).Return(uint64(1), nil).Maybe()
 	core := newTestCore(withHealthyCode(),
 		withMeta(&MetaTable{
 			catalog:     rootcoord.NewCatalog(catalogKV, ss),
@@ -94,6 +97,7 @@ func initStreamingSystemAndCore(t *testing.T) *Core {
 		withValidMixCoord(),
 		withValidProxyManager(),
 		withValidIDAllocator(),
+		withTsoAllocator(tso),
 		withBroker(newValidMockBroker()),
 	)
 	registry.ResetRegistration()
@@ -245,6 +249,16 @@ func TestRootCoord_DropCollection(t *testing.T) {
 		resp, err := c.DropCollection(ctx, &milvuspb.DropCollectionRequest{})
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_TruncateCollection(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		c := newTestCore(withAbnormalCode())
+		ctx := context.Background()
+		resp, err := c.TruncateCollection(ctx, &milvuspb.TruncateCollectionRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 }
 

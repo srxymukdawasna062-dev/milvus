@@ -31,14 +31,19 @@ import (
 
 	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/apache/arrow/go/v17/arrow/cdata"
+	"github.com/cockroachdb/errors"
+	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexcgopb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 )
 
-func NewFFIPackedReader(manifest string, schema *arrow.Schema, neededColumns []string, bufferSize int64, storageConfig *indexpb.StorageConfig, storagePluginContext *indexcgopb.StoragePluginContext) (*FFIPackedReader, error) {
-	cManifest := C.CString(manifest)
-	defer C.free(unsafe.Pointer(cManifest))
+func NewFFIPackedReader(manifestPath string, schema *arrow.Schema, neededColumns []string, bufferSize int64, storageConfig *indexpb.StorageConfig, storagePluginContext *indexcgopb.StoragePluginContext) (*FFIPackedReader, error) {
+	cColumnGroups, err := GetColumnGroups(manifestPath, storageConfig)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get manifest")
+	}
 
 	var cas cdata.CArrowSchema
 	cdata.ExportArrowSchema(schema, &cas)
@@ -101,7 +106,7 @@ func NewFFIPackedReader(manifest string, schema *arrow.Schema, neededColumns []s
 		cNeededColumnArray := (**C.char)(unsafe.Pointer(&cNeededColumn[0]))
 		cNumColumns := C.int64_t(len(neededColumns))
 
-		status = C.NewPackedFFIReaderWithManifest(cManifest, cSchema, cNeededColumnArray, cNumColumns, &cPackedReader, cStorageConfig, pluginContextPtr)
+		status = C.NewPackedFFIReaderWithManifest(cColumnGroups, cSchema, cNeededColumnArray, cNumColumns, &cPackedReader, cStorageConfig, pluginContextPtr)
 	} else {
 		return nil, fmt.Errorf("storageConfig is required")
 	}
@@ -161,13 +166,8 @@ func (r *FFIPackedReader) Close() error {
 		r.recordReader = nil
 	}
 
-	if r.cPackedReader != 0 {
-		status := C.CloseFFIReader(r.cPackedReader)
-		r.cPackedReader = 0
-		return ConsumeCStatusIntoError(&status)
-	}
-
-	return nil
+	status := C.CloseFFIReader(r.cPackedReader)
+	return ConsumeCStatusIntoError(&status)
 }
 
 // Schema returns the schema of the reader
@@ -185,6 +185,30 @@ func (r *FFIPackedReader) Retain() {
 // Release decreases the reference count
 func (r *FFIPackedReader) Release() {
 	r.Close()
+}
+
+func GetColumnGroups(manifestPath string, storageConfig *indexpb.StorageConfig) (columnGroups C.ColumnGroupsHandle, err error) {
+	var cColumnGroups C.ColumnGroupsHandle
+	basePath, version, err := UnmarshalManfestPath(manifestPath)
+	if err != nil {
+		return cColumnGroups, err
+	}
+	log.Info("GetManifest", zap.String("manifestPath", manifestPath), zap.String("basePath", basePath), zap.Int64("version", version))
+
+	cProperties, err := MakePropertiesFromStorageConfig(storageConfig, nil)
+	if err != nil {
+		return cColumnGroups, err
+	}
+	cBasePath := C.CString(basePath)
+	defer C.free(unsafe.Pointer(cBasePath))
+
+	result := C.get_column_groups_by_version(cBasePath, cProperties, C.int64_t(version), &cColumnGroups)
+	err = HandleFFIResult(result)
+	if err != nil {
+		return cColumnGroups, err
+	}
+
+	return cColumnGroups, nil
 }
 
 // Ensure FFIPackedReader implements array.RecordReader interface

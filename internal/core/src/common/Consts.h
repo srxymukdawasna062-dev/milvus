@@ -59,8 +59,9 @@ constexpr const char* JSON_STATS_ROOT_PATH = "json_stats";
 constexpr const char* JSON_STATS_DATA_FORMAT_VERSION = "2";
 constexpr const char* JSON_STATS_SHARED_INDEX_PATH = "shared_key_index";
 constexpr const char* JSON_STATS_SHREDDING_DATA_PATH = "shredding_data";
+constexpr const char* JSON_STATS_META_FILE_NAME = "meta.json";
 constexpr const char* JSON_KEY_STATS_SHARED_FIELD_NAME = "__shared";
-// store key layout type in parquet file metadata
+// store key layout type in parquet file metadata (deprecated, now stored in separate file)
 inline constexpr const char* JSON_STATS_META_KEY_LAYOUT_TYPE_MAP =
     "key_layout_type_map";
 // start json stats field id for mock column
@@ -117,6 +118,8 @@ const std::string DIM_KEY = "dim";
 const std::string DATA_TYPE_KEY = "data_type";
 const std::string ELEMENT_TYPE_KEY = "element_type";
 const std::string INDEX_NUM_ROWS_KEY = "index_num_rows";
+const std::string SEGMENT_MANIFEST_KEY = "segment_manifest";
+const std::string LOON_FFI_PROPERTIES_KEY = "loon_ffi_properties";
 
 // storage version
 const int64_t STORAGE_V1 = 1;
@@ -131,3 +134,4 @@ const std::string ELEMENT_TYPE_KEY_FOR_ARROW = "elementType";
 // EPSILON value for comparing float numbers
 const float EPSILON = 0.0000000119;
 const std::string NAMESPACE_FIELD_NAME = "$namespace_id";
+const std::string MMAP_ENABLED_KEY = "mmap.enabled";

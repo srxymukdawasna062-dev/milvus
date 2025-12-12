@@ -31,6 +31,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	mixcoord "github.com/milvus-io/milvus/internal/coordinator"
 	mix "github.com/milvus-io/milvus/internal/distributed/mixcoord/client"
 	"github.com/milvus-io/milvus/internal/distributed/utils"
@@ -729,6 +730,11 @@ func (s *Server) FlushAll(ctx context.Context, req *datapb.FlushAllRequest) (*da
 	return s.mixCoord.FlushAll(ctx, req)
 }
 
+// CreateExternalCollection creates an external collection
+func (s *Server) CreateExternalCollection(ctx context.Context, req *msgpb.CreateCollectionRequest) (*datapb.CreateExternalCollectionResponse, error) {
+	return s.mixCoord.CreateExternalCollection(ctx, req)
+}
+
 // AssignSegmentID requests to allocate segment space for insert
 func (s *Server) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest) (*datapb.AssignSegmentIDResponse, error) {
 	return s.mixCoord.AssignSegmentID(ctx, req)
@@ -937,7 +943,7 @@ func (s *Server) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzerReques
 	return s.mixCoord.RunAnalyzer(ctx, req)
 }
 
-func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*commonpb.Status, error) {
+func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*querypb.ValidateAnalyzerResponse, error) {
 	return s.mixCoord.ValidateAnalyzer(ctx, req)
 }
 
@@ -954,4 +960,9 @@ func (s *Server) RemoveFileResource(ctx context.Context, req *milvuspb.RemoveFil
 // ListFileResources list file resources
 func (s *Server) ListFileResources(ctx context.Context, req *milvuspb.ListFileResourcesRequest) (*milvuspb.ListFileResourcesResponse, error) {
 	return s.mixCoord.ListFileResources(ctx, req)
+}
+
+// TruncateCollection truncate a collection
+func (s *Server) TruncateCollection(ctx context.Context, in *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error) {
+	return s.mixCoord.TruncateCollection(ctx, in)
 }

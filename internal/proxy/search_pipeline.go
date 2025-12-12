@@ -110,8 +110,15 @@ const (
 	rerankOp             = "rerank"
 	requeryOp            = "requery"
 	organizeOp           = "organize"
-	filterFieldOp        = "filter_field"
+	endOp                = "end"
 	lambdaOp             = "lambda"
+	highlightOp          = "highlight"
+)
+
+const (
+	pipelineOutput      = "output"
+	pipelineInput       = "input"
+	pipelineStorageCost = "storage_cost"
 )
 
 var opFactory = map[string]func(t *searchTask, params map[string]any) (operator, error){
@@ -121,7 +128,8 @@ var opFactory = map[string]func(t *searchTask, params map[string]any) (operator,
 	organizeOp:           newOrganizeOperator,
 	requeryOp:            newRequeryOperator,
 	lambdaOp:             newLambdaOperator,
-	filterFieldOp:        newFilterFieldOperator,
+	endOp:                newEndOperator,
+	highlightOp:          newHighlightOperator,
 }
 
 func NewNode(info *nodeDef, t *searchTask) (*Node, error) {
@@ -563,19 +571,19 @@ func (op *lambdaOperator) run(ctx context.Context, span trace.Span, inputs ...an
 	return op.f(ctx, span, inputs...)
 }
 
-type filterFieldOperator struct {
+type endOperator struct {
 	outputFieldNames []string
 	fieldSchemas     []*schemapb.FieldSchema
 }
 
-func newFilterFieldOperator(t *searchTask, _ map[string]any) (operator, error) {
-	return &filterFieldOperator{
+func newEndOperator(t *searchTask, _ map[string]any) (operator, error) {
+	return &endOperator{
 		outputFieldNames: t.translatedOutputFields,
 		fieldSchemas:     typeutil.GetAllFieldSchemas(t.schema.CollectionSchema),
 	}, nil
 }
 
-func (op *filterFieldOperator) run(ctx context.Context, span trace.Span, inputs ...any) ([]any, error) {
+func (op *endOperator) run(ctx context.Context, span trace.Span, inputs ...any) ([]any, error) {
 	result := inputs[0].(*milvuspb.SearchResults)
 	for _, retField := range result.Results.FieldsData {
 		for _, fieldSchema := range op.fieldSchemas {
@@ -589,7 +597,13 @@ func (op *filterFieldOperator) run(ctx context.Context, span trace.Span, inputs 
 	result.Results.FieldsData = lo.Filter(result.Results.FieldsData, func(field *schemapb.FieldData, _ int) bool {
 		return lo.Contains(op.outputFieldNames, field.FieldName)
 	})
+	allSearchCount := aggregatedAllSearchCount(inputs[1].([]*milvuspb.SearchResults))
+	result.GetResults().AllSearchCount = allSearchCount
 	return []any{result}, nil
+}
+
+func newHighlightOperator(t *searchTask, _ map[string]any) (operator, error) {
+	return t.highlighter.AsSearchPipelineOperator(t)
 }
 
 func mergeIDsFunc(ctx context.Context, span trace.Span, inputs ...any) ([]any, error) {
@@ -648,11 +662,22 @@ func newPipeline(pipeDef *pipelineDef, t *searchTask) (*pipeline, error) {
 	return &pipeline{name: pipeDef.name, nodes: nodes}, nil
 }
 
+func (p *pipeline) AddNodes(t *searchTask, nodes ...*nodeDef) error {
+	for _, def := range nodes {
+		node, err := NewNode(def, t)
+		if err != nil {
+			return err
+		}
+		p.nodes = append(p.nodes, node)
+	}
+	return nil
+}
+
 func (p *pipeline) Run(ctx context.Context, span trace.Span, toReduceResults []*internalpb.SearchResults, storageCost segcore.StorageCost) (*milvuspb.SearchResults, segcore.StorageCost, error) {
 	log.Ctx(ctx).Debug("SearchPipeline run", zap.String("pipeline", p.String()))
 	msg := opMsg{}
-	msg["input"] = toReduceResults
-	msg["storage_cost"] = storageCost
+	msg[pipelineInput] = toReduceResults
+	msg[pipelineStorageCost] = storageCost
 	for _, node := range p.nodes {
 		var err error
 		log.Ctx(ctx).Debug("SearchPipeline run node", zap.String("node", node.name))
@@ -662,7 +687,7 @@ func (p *pipeline) Run(ctx context.Context, span trace.Span, toReduceResults []*
 			return nil, storageCost, err
 		}
 	}
-	return msg["output"].(*milvuspb.SearchResults), msg["storage_cost"].(segcore.StorageCost), nil
+	return msg[pipelineOutput].(*milvuspb.SearchResults), msg[pipelineStorageCost].(segcore.StorageCost), nil
 }
 
 func (p *pipeline) String() string {
@@ -678,12 +703,26 @@ type pipelineDef struct {
 	nodes []*nodeDef
 }
 
+var endNode = &nodeDef{
+	name:    "filter_field",
+	inputs:  []string{"result", "reduced"},
+	outputs: []string{pipelineOutput},
+	opName:  endOp,
+}
+
+var highlightNode = &nodeDef{
+	name:    "highlight",
+	inputs:  []string{"result"},
+	outputs: []string{pipelineOutput},
+	opName:  highlightOp,
+}
+
 var searchPipe = &pipelineDef{
 	name: "search",
 	nodes: []*nodeDef{
 		{
 			name:    "reduce",
-			inputs:  []string{"input", "storage_cost"},
+			inputs:  []string{pipelineInput, pipelineStorageCost},
 			outputs: []string{"reduced", "metrics"},
 			opName:  searchReduceOp,
 		},
@@ -699,12 +738,6 @@ var searchPipe = &pipelineDef{
 			},
 			opName: lambdaOp,
 		},
-		{
-			name:    "filter_field",
-			inputs:  []string{"result"},
-			outputs: []string{"output"},
-			opName:  filterFieldOp,
-		},
 	},
 }
 
@@ -713,7 +746,7 @@ var searchWithRequeryPipe = &pipelineDef{
 	nodes: []*nodeDef{
 		{
 			name:    "reduce",
-			inputs:  []string{"input", "storage_cost"},
+			inputs:  []string{pipelineInput, pipelineStorageCost},
 			outputs: []string{"reduced", "metrics"},
 			opName:  searchReduceOp,
 		},
@@ -728,8 +761,8 @@ var searchWithRequeryPipe = &pipelineDef{
 		},
 		{
 			name:    "requery",
-			inputs:  []string{"unique_ids", "storage_cost"},
-			outputs: []string{"fields", "storage_cost"},
+			inputs:  []string{"unique_ids", pipelineStorageCost},
+			outputs: []string{"fields", pipelineStorageCost},
 			opName:  requeryOp,
 		},
 		{
@@ -763,12 +796,6 @@ var searchWithRequeryPipe = &pipelineDef{
 			},
 			opName: lambdaOp,
 		},
-		{
-			name:    "filter_field",
-			inputs:  []string{"result"},
-			outputs: []string{"output"},
-			opName:  filterFieldOp,
-		},
 	},
 }
 
@@ -777,7 +804,7 @@ var searchWithRerankPipe = &pipelineDef{
 	nodes: []*nodeDef{
 		{
 			name:    "reduce",
-			inputs:  []string{"input", "storage_cost"},
+			inputs:  []string{pipelineInput, pipelineStorageCost},
 			outputs: []string{"reduced", "metrics"},
 			opName:  searchReduceOp,
 		},
@@ -821,12 +848,6 @@ var searchWithRerankPipe = &pipelineDef{
 			},
 			opName: lambdaOp,
 		},
-		{
-			name:    "filter_field",
-			inputs:  []string{"result"},
-			outputs: []string{"output"},
-			opName:  filterFieldOp,
-		},
 	},
 }
 
@@ -835,7 +856,7 @@ var searchWithRerankRequeryPipe = &pipelineDef{
 	nodes: []*nodeDef{
 		{
 			name:    "reduce",
-			inputs:  []string{"input", "storage_cost"},
+			inputs:  []string{pipelineInput, pipelineStorageCost},
 			outputs: []string{"reduced", "metrics"},
 			opName:  searchReduceOp,
 		},
@@ -860,8 +881,8 @@ var searchWithRerankRequeryPipe = &pipelineDef{
 		},
 		{
 			name:    "requery",
-			inputs:  []string{"ids", "storage_cost"},
-			outputs: []string{"fields", "storage_cost"},
+			inputs:  []string{"ids", pipelineStorageCost},
+			outputs: []string{"fields", pipelineStorageCost},
 			opName:  requeryOp,
 		},
 		{
@@ -895,12 +916,6 @@ var searchWithRerankRequeryPipe = &pipelineDef{
 			},
 			opName: lambdaOp,
 		},
-		{
-			name:    "filter_field",
-			inputs:  []string{"result"},
-			outputs: []string{"output"},
-			opName:  filterFieldOp,
-		},
 	},
 }
 
@@ -909,7 +924,7 @@ var hybridSearchPipe = &pipelineDef{
 	nodes: []*nodeDef{
 		{
 			name:    "reduce",
-			inputs:  []string{"input", "storage_cost"},
+			inputs:  []string{pipelineInput, pipelineStorageCost},
 			outputs: []string{"reduced", "metrics"},
 			opName:  hybridSearchReduceOp,
 		},
@@ -919,12 +934,6 @@ var hybridSearchPipe = &pipelineDef{
 			outputs: []string{"result"},
 			opName:  rerankOp,
 		},
-		{
-			name:    "filter_field",
-			inputs:  []string{"result"},
-			outputs: []string{"output"},
-			opName:  filterFieldOp,
-		},
 	},
 }
 
@@ -933,7 +942,7 @@ var hybridSearchWithRequeryAndRerankByFieldDataPipe = &pipelineDef{
 	nodes: []*nodeDef{
 		{
 			name:    "reduce",
-			inputs:  []string{"input", "storage_cost"},
+			inputs:  []string{pipelineInput, pipelineStorageCost},
 			outputs: []string{"reduced", "metrics"},
 			opName:  hybridSearchReduceOp,
 		},
@@ -948,8 +957,8 @@ var hybridSearchWithRequeryAndRerankByFieldDataPipe = &pipelineDef{
 		},
 		{
 			name:    "requery",
-			inputs:  []string{"ids", "storage_cost"},
-			outputs: []string{"fields", "storage_cost"},
+			inputs:  []string{"ids", pipelineStorageCost},
+			outputs: []string{"fields", pipelineStorageCost},
 			opName:  requeryOp,
 		},
 		{
@@ -1026,12 +1035,6 @@ var hybridSearchWithRequeryAndRerankByFieldDataPipe = &pipelineDef{
 			},
 			opName: lambdaOp,
 		},
-		{
-			name:    "filter_field",
-			inputs:  []string{"result"},
-			outputs: []string{"output"},
-			opName:  filterFieldOp,
-		},
 	},
 }
 
@@ -1040,7 +1043,7 @@ var hybridSearchWithRequeryPipe = &pipelineDef{
 	nodes: []*nodeDef{
 		{
 			name:    "reduce",
-			inputs:  []string{"input", "storage_cost"},
+			inputs:  []string{pipelineInput, pipelineStorageCost},
 			outputs: []string{"reduced", "metrics"},
 			opName:  hybridSearchReduceOp,
 		},
@@ -1065,8 +1068,8 @@ var hybridSearchWithRequeryPipe = &pipelineDef{
 		},
 		{
 			name:    "requery",
-			inputs:  []string{"ids", "storage_cost"},
-			outputs: []string{"fields", "storage_cost"},
+			inputs:  []string{"ids", pipelineStorageCost},
+			outputs: []string{"fields", pipelineStorageCost},
 			opName:  requeryOp,
 		},
 		{
@@ -1091,9 +1094,9 @@ var hybridSearchWithRequeryPipe = &pipelineDef{
 		},
 		{
 			name:    "filter_field",
-			inputs:  []string{"result"},
-			outputs: []string{"output"},
-			opName:  filterFieldOp,
+			inputs:  []string{"result", "reduced"},
+			outputs: []string{pipelineOutput},
+			opName:  endOp,
 		},
 	},
 }
@@ -1127,4 +1130,34 @@ func newBuiltInPipeline(t *searchTask) (*pipeline, error) {
 		}
 	}
 	return nil, fmt.Errorf("Unsupported pipeline")
+}
+
+func newSearchPipeline(t *searchTask) (*pipeline, error) {
+	p, err := newBuiltInPipeline(t)
+	if err != nil {
+		return nil, err
+	}
+
+	if t.highlighter != nil {
+		err := p.AddNodes(t, highlightNode, endNode)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		err := p.AddNodes(t, endNode)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return p, nil
+}
+
+func aggregatedAllSearchCount(searchResults []*milvuspb.SearchResults) int64 {
+	allSearchCount := int64(0)
+	for _, sr := range searchResults {
+		if sr != nil && sr.GetResults() != nil {
+			allSearchCount += sr.GetResults().GetAllSearchCount()
+		}
+	}
+	return allSearchCount
 }

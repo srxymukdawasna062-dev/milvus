@@ -56,7 +56,10 @@ func (t *mixCompactionTask) GetTaskSlot() int64 {
 		if t.GetTaskProto().GetType() == datapb.CompactionType_SortCompaction {
 			segment := t.meta.GetHealthySegment(context.Background(), t.GetTaskProto().GetInputSegments()[0])
 			if segment != nil {
-				slotUsage = calculateStatsTaskSlot(segment.getSegmentSize())
+				segSize := segment.getSegmentSize()
+				slotUsage = calculateStatsTaskSlot(segSize)
+				log.Info("mixCompactionTask get task slot",
+					zap.Int64("segment size", segSize), zap.Int64("task slot", slotUsage))
 			}
 		}
 		t.slotUsage.Store(slotUsage)
@@ -126,12 +129,10 @@ func (t *mixCompactionTask) QueryTaskOnWorker(cluster session.Cluster) {
 		PlanID: t.GetTaskProto().GetPlanID(),
 	})
 	if err != nil || result == nil {
-		if errors.Is(err, merr.ErrNodeNotFound) {
-			if err := t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID)); err != nil {
-				log.Warn("mixCompactionTask failed to updateAndSaveTaskMeta", zap.Error(err))
-			}
-		}
 		log.Warn("mixCompactionTask failed to get compaction result", zap.Error(err))
+		if err := t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID)); err != nil {
+			log.Warn("mixCompactionTask failed to updateAndSaveTaskMeta", zap.Error(err))
+		}
 		return
 	}
 	switch result.GetState() {
@@ -404,6 +405,7 @@ func (t *mixCompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, er
 			Deltalogs:           segInfo.GetDeltalogs(),
 			IsSorted:            segInfo.GetIsSorted(),
 			StorageVersion:      segInfo.GetStorageVersion(),
+			Manifest:            segInfo.GetManifestPath(),
 		})
 		segIDMap[segID] = segInfo.GetDeltalogs()
 		segments = append(segments, segInfo)

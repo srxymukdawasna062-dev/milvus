@@ -288,6 +288,7 @@ type commonConfig struct {
 	Stv2SystemColumnIncludeClusteringKey ParamItem `refreshable:"true"`
 	Stv2SplitByAvgSize                   ParamItem `refreshable:"true"`
 	Stv2SplitAvgSizeThreshold            ParamItem `refreshable:"true"`
+	UseLoonFFI                           ParamItem `refreshable:"true"`
 
 	StoragePathPrefix         ParamItem `refreshable:"false"`
 	StorageZstdConcurrency    ParamItem `refreshable:"false"`
@@ -938,6 +939,14 @@ Large numeric passwords require double quotes to avoid yaml parsing precision is
 	}
 	p.EnableStorageV2.Init(base.mgr)
 
+	p.UseLoonFFI = ParamItem{
+		Key:          "common.storage.useLoonFFI",
+		Version:      "2.6.7",
+		DefaultValue: "false",
+		Export:       true,
+	}
+	p.UseLoonFFI.Init(base.mgr)
+
 	p.Stv2SplitSystemColumn = ParamItem{
 		Key:          "common.storage.stv2.splitSystemColumn.enabled",
 		Version:      "2.6.2",
@@ -1504,14 +1513,22 @@ func (t *holmesConfig) init(base *BaseTable) {
 }
 
 type logConfig struct {
-	Level        ParamItem `refreshable:"false"`
-	RootPath     ParamItem `refreshable:"false"`
-	MaxSize      ParamItem `refreshable:"false"`
-	MaxAge       ParamItem `refreshable:"false"`
-	MaxBackups   ParamItem `refreshable:"false"`
-	Format       ParamItem `refreshable:"false"`
-	Stdout       ParamItem `refreshable:"false"`
-	GrpcLogLevel ParamItem `refreshable:"false"`
+	Level                       ParamItem `refreshable:"false"`
+	RootPath                    ParamItem `refreshable:"false"`
+	MaxSize                     ParamItem `refreshable:"false"`
+	MaxAge                      ParamItem `refreshable:"false"`
+	MaxBackups                  ParamItem `refreshable:"false"`
+	Format                      ParamItem `refreshable:"false"`
+	Stdout                      ParamItem `refreshable:"false"`
+	GrpcLogLevel                ParamItem `refreshable:"false"`
+	AsyncWriteEnable            ParamItem `refreshable:"false"`
+	AsyncWriteFlushInterval     ParamItem `refreshable:"false"`
+	AsyncWriteDroppedTimeout    ParamItem `refreshable:"false"`
+	AsyncWriteNonDroppableLevel ParamItem `refreshable:"false"`
+	AsyncWriteStopTimeout       ParamItem `refreshable:"false"`
+	AsyncWritePendingLength     ParamItem `refreshable:"false"`
+	AsyncWriteBufferSize        ParamItem `refreshable:"false"`
+	AsyncWriteMaxBytesPerLog    ParamItem `refreshable:"false"`
 }
 
 func (l *logConfig) init(base *BaseTable) {
@@ -1588,6 +1605,97 @@ Set this parameter as the path that you have permission to write.`,
 		Export:       true,
 	}
 	l.GrpcLogLevel.Init(base.mgr)
+
+	l.AsyncWriteEnable = ParamItem{
+		Key:          "log.asyncWrite.enable",
+		DefaultValue: "true",
+		Version:      "2.6.7",
+		Doc:          "Enable async write for the logger.",
+		Export:       false,
+	}
+	l.AsyncWriteEnable.Init(base.mgr)
+
+	l.AsyncWriteFlushInterval = ParamItem{
+		Key:          "log.asyncWrite.flushInterval",
+		DefaultValue: "10s",
+		Version:      "2.6.7",
+		Doc: `The interval to flush the logs.
+Lower the interval, More frequent the flush will be applied, 
+Faster the logging writes can be seen by the underlying file system.`,
+		Export: false,
+	}
+	l.AsyncWriteFlushInterval.Init(base.mgr)
+
+	l.AsyncWriteDroppedTimeout = ParamItem{
+		Key:          "log.asyncWrite.droppedTimeout",
+		DefaultValue: "100ms",
+		Version:      "2.6.7",
+		Doc: `The timeout to drop the write operation if the buffer is full.
+Once the underlying buffered writer is blocked or too slow and
+the pending length is larger than the pending length threshold,
+the new incoming write operation will be dropped if it exceeds the timeout.`,
+		Export: false,
+	}
+	l.AsyncWriteDroppedTimeout.Init(base.mgr)
+
+	l.AsyncWriteNonDroppableLevel = ParamItem{
+		Key:          "log.asyncWrite.nonDroppableLevel",
+		DefaultValue: "error",
+		Version:      "2.6.7",
+		Doc: `The level that will not be dropped when the buffer is full.
+Once the level is greater or equal to the non-droppable level, 
+the write operation will not be dropped because the buffer is full`,
+		Export: false,
+	}
+	l.AsyncWriteNonDroppableLevel.Init(base.mgr)
+
+	l.AsyncWriteStopTimeout = ParamItem{
+		Key:          "log.asyncWrite.stopTimeout",
+		DefaultValue: "1s",
+		Version:      "2.6.7",
+		Doc: `The timeout to stop the async write.
+When the milvus is on shutdown, 
+the async writer of logger will try to flush all the pending write operations 
+to the underlying file system until reaching the timeout.`,
+		Export: false,
+	}
+	l.AsyncWriteStopTimeout.Init(base.mgr)
+
+	l.AsyncWritePendingLength = ParamItem{
+		Key:          "log.asyncWrite.pendingLength",
+		DefaultValue: "1024",
+		Version:      "2.6.7",
+		Doc: `The maximum number of pending write operation.
+Once the underlying buffered writer is blocked or too slow, 
+the pending write operation will be cached in the buffer.
+The larger the pending length, the more memory is used, the less logging writes will be dropped.`,
+		Export: false,
+	}
+	l.AsyncWritePendingLength.Init(base.mgr)
+
+	l.AsyncWriteBufferSize = ParamItem{
+		Key:          "log.asyncWrite.bufferSize",
+		DefaultValue: "4k",
+		Version:      "2.6.7",
+		Doc: `The buffer size of the underlying bufio writer. 
+The larger the buffer size, the more memory is used, 
+but the less the number of writes to the underlying file system.
+Because the cpp will print the log message into stdout, 
+when the logging is woring with pipe like tty/docker log driver/k8s,
+PIPE_BUF=4096 may interleave the go log and cpp log together, so 4kb is set as default value to avoid this.`,
+		Export: false,
+	}
+	l.AsyncWriteBufferSize.Init(base.mgr)
+
+	l.AsyncWriteMaxBytesPerLog = ParamItem{
+		Key:          "log.asyncWrite.maxBytesPerLog",
+		DefaultValue: "1m",
+		Version:      "2.6.7",
+		Doc: `The max bytes per log.
+Once the log message exceeds the max bytes per log, it will be truncated.`,
+		Export: false,
+	}
+	l.AsyncWriteMaxBytesPerLog.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////
@@ -2386,7 +2494,11 @@ type queryCoordConfig struct {
 	// query node task parallelism factor
 	QueryNodeTaskParallelismFactor ParamItem `refreshable:"true"`
 
-	BalanceCheckCollectionMaxCount ParamItem `refreshable:"true"`
+	BalanceCheckCollectionMaxCount    ParamItem `refreshable:"true"`
+	ResourceExhaustionPenaltyDuration ParamItem `refreshable:"true"`
+	ResourceExhaustionCleanupInterval ParamItem `refreshable:"true"`
+
+	FileResourceMode ParamItem `refreshable:"false"`
 }
 
 func (p *queryCoordConfig) init(base *BaseTable) {
@@ -2397,6 +2509,13 @@ func (p *queryCoordConfig) init(base *BaseTable) {
 		DefaultValue: "5",
 	}
 	p.RetryNum.Init(base.mgr)
+
+	p.FileResourceMode = ParamItem{
+		Key:          "queryCoord.fileResource.mode",
+		Version:      "2.6.3",
+		DefaultValue: "sync",
+	}
+	p.FileResourceMode.Init(base.mgr)
 
 	p.RetryInterval = ParamItem{
 		Key:          "queryCoord.task.retryinterval",
@@ -3028,6 +3147,25 @@ If this parameter is set false, Milvus simply searches the growing segments with
 		Export:       false,
 	}
 	p.BalanceCheckCollectionMaxCount.Init(base.mgr)
+	p.ResourceExhaustionPenaltyDuration = ParamItem{
+		Key:          "queryCoord.resourceExhaustionPenaltyDuration",
+		Version:      "2.6.7",
+		DefaultValue: "30",
+		Doc: `Duration (in seconds) that a query node remains marked as resource exhausted after reaching resource limits.
+During this period, the node won't receive new tasks to loading resource.
+Set to 0 to disable the penalty period.`,
+		Export: true,
+	}
+	p.ResourceExhaustionPenaltyDuration.Init(base.mgr)
+
+	p.ResourceExhaustionCleanupInterval = ParamItem{
+		Key:          "queryCoord.resourceExhaustionCleanupInterval",
+		Version:      "2.6.7",
+		DefaultValue: "10",
+		Doc:          "Interval (in seconds) for cleaning up expired resource exhaustion marks on query nodes.",
+		Export:       true,
+	}
+	p.ResourceExhaustionCleanupInterval.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////
@@ -3139,9 +3277,10 @@ type queryNodeConfig struct {
 	ForwardBatchSize            ParamItem `refreshable:"true"`
 
 	// loader
-	IoPoolSize             ParamItem `refreshable:"false"`
-	DeltaDataExpansionRate ParamItem `refreshable:"true"`
-	DiskSizeFetchInterval  ParamItem `refreshable:"false"`
+	IoPoolSize                  ParamItem `refreshable:"false"`
+	DeltaDataExpansionRate      ParamItem `refreshable:"true"`
+	JSONKeyStatsExpansionFactor ParamItem `refreshable:"true"`
+	DiskSizeFetchInterval       ParamItem `refreshable:"false"`
 
 	// schedule task policy.
 	SchedulePolicyName                    ParamItem `refreshable:"false"`
@@ -4140,6 +4279,14 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	}
 	p.DeltaDataExpansionRate.Init(base.mgr)
 
+	p.JSONKeyStatsExpansionFactor = ParamItem{
+		Key:          "querynode.JSONKeyStatsExpansionFactor",
+		Version:      "2.6.7",
+		DefaultValue: "1.0",
+		Doc:          "the expansion factor for json key stats memory size estimation",
+	}
+	p.JSONKeyStatsExpansionFactor.Init(base.mgr)
+
 	p.DiskSizeFetchInterval = ParamItem{
 		Key:          "querynode.diskSizeFetchInterval",
 		Version:      "2.5.0",
@@ -4479,6 +4626,7 @@ type dataCoordConfig struct {
 	MixCompactionSlotUsage        ParamItem `refreshable:"true"`
 	L0DeleteCompactionSlotUsage   ParamItem `refreshable:"true"`
 	IndexTaskSlotUsage            ParamItem `refreshable:"true"`
+	ScalarIndexTaskSlotUsage      ParamItem `refreshable:"true"`
 	StatsTaskSlotUsage            ParamItem `refreshable:"true"`
 	AnalyzeTaskSlotUsage          ParamItem `refreshable:"true"`
 
@@ -4492,6 +4640,7 @@ type dataCoordConfig struct {
 	JSONStatsWriteBatchSize          ParamItem `refreshable:"true"`
 
 	RequestTimeoutSeconds ParamItem `refreshable:"true"`
+	FileResourceMode      ParamItem `refreshable:"false"`
 }
 
 func (p *dataCoordConfig) init(base *BaseTable) {
@@ -4503,6 +4652,13 @@ func (p *dataCoordConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.WatchTimeoutInterval.Init(base.mgr)
+
+	p.FileResourceMode = ParamItem{
+		Key:          "dataCoord.fileResource.mode",
+		Version:      "2.6.3",
+		DefaultValue: "sync",
+	}
+	p.FileResourceMode.Init(base.mgr)
 
 	p.LegacyVersionWithoutRPCWatch = ParamItem{
 		Key:          "dataCoord.channel.legacyVersionWithoutRPCWatch",
@@ -5496,6 +5652,16 @@ if param targetVecIndexVersion is not set, the default value is -1, which means 
 	}
 	p.IndexTaskSlotUsage.Init(base.mgr)
 
+	p.ScalarIndexTaskSlotUsage = ParamItem{
+		Key:          "dataCoord.slot.scalarIndexTaskSlotUsage",
+		Version:      "2.6.8",
+		Doc:          "slot usage of scalar index task per 512mb",
+		DefaultValue: "16",
+		PanicIfEmpty: false,
+		Export:       true,
+	}
+	p.ScalarIndexTaskSlotUsage.Init(base.mgr)
+
 	p.StatsTaskSlotUsage = ParamItem{
 		Key:          "dataCoord.slot.statsTaskSlotUsage",
 		Version:      "2.5.8",
@@ -6210,12 +6376,10 @@ type streamingConfig struct {
 	FlushL0MaxSize     ParamItem `refreshable:"true"`
 
 	// recovery configuration.
-	WALRecoveryPersistInterval      ParamItem `refreshable:"true"`
-	WALRecoveryMaxDirtyMessage      ParamItem `refreshable:"true"`
-	WALRecoveryGracefulCloseTimeout ParamItem `refreshable:"true"`
-
-	WALTruncateSampleInterval    ParamItem `refreshable:"true"`
-	WALTruncateRetentionInterval ParamItem `refreshable:"true"`
+	WALRecoveryPersistInterval           ParamItem `refreshable:"true"`
+	WALRecoveryMaxDirtyMessage           ParamItem `refreshable:"true"`
+	WALRecoveryGracefulCloseTimeout      ParamItem `refreshable:"true"`
+	WALRecoverySchemaExpirationTolerance ParamItem `refreshable:"true"`
 }
 
 func (p *streamingConfig) init(base *BaseTable) {
@@ -6378,10 +6542,10 @@ too few tombstones may lead to ABA issues in the state of milvus cluster.`,
 	p.WALBroadcasterTombstoneMaxCount = ParamItem{
 		Key:     "streaming.walBroadcaster.tombstone.maxCount",
 		Version: "2.6.0",
-		Doc: `The max count of tombstone, 256 by default. 
+		Doc: `The max count of tombstone, 8192 by default. 
 Tombstone is used to reject duplicate submissions of DDL messages,
 too few tombstones may lead to ABA issues in the state of milvus cluster.`,
-		DefaultValue: "256",
+		DefaultValue: "8192",
 		Export:       false,
 	}
 	p.WALBroadcasterTombstoneMaxCount.Init(base.mgr)
@@ -6389,10 +6553,10 @@ too few tombstones may lead to ABA issues in the state of milvus cluster.`,
 	p.WALBroadcasterTombstoneMaxLifetime = ParamItem{
 		Key:     "streaming.walBroadcaster.tombstone.maxLifetime",
 		Version: "2.6.0",
-		Doc: `The max lifetime of tombstone, 30m by default.
+		Doc: `The max lifetime of tombstone, 24h by default.
 Tombstone is used to reject duplicate submissions of DDL messages,
 too few tombstones may lead to ABA issues in the state of milvus cluster.`,
-		DefaultValue: "30m",
+		DefaultValue: "24h",
 		Export:       false,
 	}
 	p.WALBroadcasterTombstoneMaxLifetime.Init(base.mgr)
@@ -6541,31 +6705,15 @@ If that persist operation exceeds this timeout, the wal recovery module will clo
 	}
 	p.WALRecoveryGracefulCloseTimeout.Init(base.mgr)
 
-	p.WALTruncateSampleInterval = ParamItem{
-		Key:     "streaming.walTruncate.sampleInterval",
-		Version: "2.6.0",
-		Doc: `The interval of sampling wal checkpoint when truncate, 30m by default.
-Every time the checkpoint is persisted, the checkpoint will be sampled and used to be a candidate of truncate checkpoint.
-More samples, more frequent truncate, more memory usage.`,
-		DefaultValue: "30m",
-		Export:       true,
+	p.WALRecoverySchemaExpirationTolerance = ParamItem{
+		Key:     "streaming.walRecovery.schemaExpirationTolerance",
+		Version: "2.6.8",
+		Doc: `The tolerance of schema expiration for wal recovery, 24h by default.
+If the schema is older than (the channel checkpoint - tolerance), it will be removed forever.`,
+		DefaultValue: "24h",
+		Export:       false,
 	}
-	p.WALTruncateSampleInterval.Init(base.mgr)
-
-	p.WALTruncateRetentionInterval = ParamItem{
-		Key:     "streaming.walTruncate.retentionInterval",
-		Version: "2.6.0",
-		Doc: `The retention interval of wal truncate, 72h by default.
-If the sampled checkpoint is older than this interval, it will be used to truncate wal checkpoint.
-Greater the interval, more wal storage usage, more redundant data in wal.
-Because current query path doesn't promise the read operation not happen before the truncate point,
-retention interval should be greater than the dataCoord.segment.maxLife to avoid the message lost at query path.
-If the wal is pulsar, the pulsar should close the subscription expiration to avoid the message lost.
-because the wal truncate operation is implemented by pulsar consumer.`,
-		DefaultValue: "72h",
-		Export:       true,
-	}
-	p.WALTruncateRetentionInterval.Init(base.mgr)
+	p.WALRecoverySchemaExpirationTolerance.Init(base.mgr)
 }
 
 // runtimeConfig is just a private environment value table.

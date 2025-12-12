@@ -59,6 +59,7 @@ DiskFileManagerImpl::DiskFileManagerImpl(
     rcm_ = fileManagerContext.chunkManagerPtr;
     fs_ = fileManagerContext.fs;
     plugin_context_ = fileManagerContext.plugin_context;
+    loon_ffi_properties_ = fileManagerContext.loon_ffi_properties;
 }
 
 DiskFileManagerImpl::~DiskFileManagerImpl() {
@@ -110,6 +111,18 @@ DiskFileManagerImpl::GetRemoteJsonStatsShreddingPrefix() {
     fs::path prefix = GetRemoteJsonStatsLogPrefix();
     fs::path suffix = JSON_STATS_SHREDDING_DATA_PATH;
     return (prefix / suffix).string();
+}
+
+std::string
+DiskFileManagerImpl::GetRemoteJsonStatsMetaPath(const std::string& file_name) {
+    namespace fs = std::filesystem;
+    fs::path prefix = GetRemoteJsonStatsLogPrefix();
+    return (prefix / file_name).string();
+}
+
+std::string
+DiskFileManagerImpl::GetLocalJsonStatsMetaPrefix() {
+    return GetLocalJsonStatsPrefix();
 }
 
 bool
@@ -229,6 +242,38 @@ DiskFileManagerImpl::AddJsonSharedIndexLog(const std::string& file) noexcept {
 }
 
 bool
+DiskFileManagerImpl::AddJsonStatsMetaLog(const std::string& file) noexcept {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    FILEMANAGER_TRY
+    if (!local_chunk_manager->Exist(file)) {
+        LOG_ERROR("local meta file {} not exists", file);
+        return false;
+    }
+
+    local_paths_.emplace_back(file);
+    auto fileName = GetFileName(file);
+    auto fileSize = local_chunk_manager->Size(file);
+    added_total_file_size_ += fileSize;
+
+    // Meta file is small, upload directly without slicing
+    auto remote_path = GetRemoteJsonStatsMetaPath(fileName);
+    auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
+    local_chunk_manager->Read(file, buf.get(), fileSize);
+    rcm_->Write(remote_path, buf.get(), fileSize);
+
+    remote_paths_to_size_[remote_path] = fileSize;
+    LOG_INFO("upload json stats meta file: {} to remote: {}, size: {}",
+             file,
+             remote_path,
+             fileSize);
+
+    FILEMANAGER_CATCH
+    FILEMANAGER_END
+    return true;
+}
+
+bool
 DiskFileManagerImpl::AddTextLog(const std::string& file) noexcept {
     return AddFileInternal(
         file, [this](const std::string& file_name, int slice_num) {
@@ -316,6 +361,11 @@ DiskFileManagerImpl::CacheIndexToDiskInternal(
         std::sort(slices.second.begin(), slices.second.end());
     }
 
+    // TODO: remove this log when #45590 is solved
+    LOG_INFO("CacheIndexToDisk: caching {} files to {}",
+             index_slices.size(),
+             local_index_prefix);
+
     for (auto& slices : index_slices) {
         auto prefix = slices.first;
         auto local_index_file_name =
@@ -361,6 +411,8 @@ DiskFileManagerImpl::CacheIndexToDiskInternal(
         }
 
         local_paths_.emplace_back(local_index_file_name);
+        // TODO: remove this log when #45590 is solved
+        LOG_INFO("CacheIndexToDisk: cached file {}", local_index_file_name);
     }
 }
 
@@ -394,6 +446,40 @@ DiskFileManagerImpl::CacheJsonStatsSharedIndexToDisk(
     milvus::proto::common::LoadPriority priority) {
     return CacheIndexToDiskInternal(
         remote_files, GetLocalJsonStatsSharedIndexPrefix(), priority);
+}
+
+std::string
+DiskFileManagerImpl::CacheJsonStatsMetaToDisk(
+    const std::string& remote_file,
+    milvus::proto::common::LoadPriority priority) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    auto local_prefix = GetLocalJsonStatsMetaPrefix();
+
+    auto file_name = remote_file.substr(remote_file.find_last_of('/') + 1);
+    auto local_file =
+        (std::filesystem::path(local_prefix) / file_name).string();
+
+    auto parent_path = std::filesystem::path(local_file).parent_path();
+    if (!local_chunk_manager->Exist(parent_path.string())) {
+        local_chunk_manager->CreateDir(parent_path.string());
+    }
+
+    auto remote_prefix = GetRemoteJsonStatsLogPrefix();
+    auto full_remote_path =
+        (std::filesystem::path(remote_prefix) / remote_file).string();
+
+    auto file_size = rcm_->Size(full_remote_path);
+    auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[file_size]);
+    rcm_->Read(full_remote_path, buf.get(), file_size);
+    local_chunk_manager->Write(local_file, buf.get(), file_size);
+
+    LOG_INFO("Cached json stats meta file from {} to {}, size: {}",
+             full_remote_path,
+             local_file,
+             file_size);
+
+    return local_file;
 }
 
 template <typename DataType>
@@ -652,12 +738,28 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
     uint32_t var_dim = 0;
     int64_t write_offset = sizeof(num_rows) + sizeof(var_dim);
 
-    auto field_datas = GetFieldDatasFromStorageV2(all_remote_files,
-                                                  GetFieldDataMeta().field_id,
-                                                  data_type.value(),
-                                                  element_type.value(),
-                                                  dim,
-                                                  fs_);
+    std::vector<FieldDataPtr> field_datas;
+    auto manifest =
+        index::GetValueFromConfig<std::string>(config, SEGMENT_MANIFEST_KEY);
+    auto manifest_path_str = manifest.value_or("");
+    if (manifest_path_str != "") {
+        AssertInfo(
+            loon_ffi_properties_ != nullptr,
+            "loon ffi properties is null when build index with manifest");
+        field_datas = GetFieldDatasFromManifest(manifest_path_str,
+                                                loon_ffi_properties_,
+                                                field_meta_,
+                                                data_type,
+                                                dim,
+                                                element_type);
+    } else {
+        field_datas = GetFieldDatasFromStorageV2(all_remote_files,
+                                                 GetFieldDataMeta().field_id,
+                                                 data_type.value(),
+                                                 element_type.value(),
+                                                 dim,
+                                                 fs_);
+    }
     for (auto& field_data : field_datas) {
         num_rows += uint32_t(field_data->get_num_rows());
         cache_raw_data_to_disk_common<T>(field_data,
@@ -719,6 +821,13 @@ DiskFileManagerImpl::RemoveTextLogFiles() {
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
     local_chunk_manager->RemoveDir(GetLocalTextIndexPrefix());
+}
+
+void
+DiskFileManagerImpl::RemoveJsonStatsSharedIndexFiles() {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    local_chunk_manager->RemoveDir(GetLocalJsonStatsSharedIndexPrefix());
 }
 
 void

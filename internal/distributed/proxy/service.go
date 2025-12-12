@@ -49,6 +49,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	mix "github.com/milvus-io/milvus/internal/distributed/mixcoord/client"
 	"github.com/milvus-io/milvus/internal/distributed/proxy/httpserver"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/distributed/utils"
 	mhttp "github.com/milvus-io/milvus/internal/http"
 	"github.com/milvus-io/milvus/internal/proxy"
@@ -129,6 +130,7 @@ func authenticate(c *gin.Context) {
 		if proxy.PasswordVerify(c, username, password) {
 			log.Ctx(context.TODO()).Debug("auth successful", zap.String("username", username))
 			c.Set(httpserver.ContextUsername, username)
+			c.Set(httpserver.ContextToken, fmt.Sprintf("%s%s%s", username, util.CredentialSeperator, password))
 			return
 		}
 	}
@@ -239,6 +241,7 @@ func (s *Server) startExternalGrpc(errChan chan error) {
 	var unaryServerOption grpc.ServerOption
 	if enableCustomInterceptor {
 		unaryServerOption = grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			streaming.ForwardLegacyProxyUnaryServerInterceptor(),
 			proxy.DatabaseInterceptor(),
 			UnaryRequestStatsInterceptor,
 			accesslog.UnaryAccessLogInterceptor,
@@ -622,6 +625,11 @@ func (s *Server) CreateCollection(ctx context.Context, request *milvuspb.CreateC
 // DropCollection notifies Proxy to drop a collection
 func (s *Server) DropCollection(ctx context.Context, request *milvuspb.DropCollectionRequest) (*commonpb.Status, error) {
 	return s.proxy.DropCollection(ctx, request)
+}
+
+// TruncateCollection notifies Proxy to truncate a collection
+func (s *Server) TruncateCollection(ctx context.Context, request *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error) {
+	return s.proxy.TruncateCollection(ctx, request)
 }
 
 // HasCollection notifies Proxy to check a collection's existence at specified timestamp

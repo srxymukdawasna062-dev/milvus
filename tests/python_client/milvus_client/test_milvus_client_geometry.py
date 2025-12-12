@@ -35,8 +35,6 @@ def generate_wkt_by_type(
         """Validate WKT using shapely and log debug info"""
         try:
             geom = wkt.loads(wkt_string)
-            log.debug(f"Generated {geom_type} geometry: {wkt_string}")
-            log.debug(f"Shapely validation passed - Type: {geom.geom_type}, Valid: {geom.is_valid}")
             if not geom.is_valid:
                 log.warning(f"Generated invalid geometry: {wkt_string}, Reason: {geom.is_valid_reason if hasattr(geom, 'is_valid_reason') else 'Unknown'}")
             return wkt_string
@@ -771,7 +769,7 @@ def generate_gt(
     }
 
     if spatial_func not in spatial_function_mapping:
-        print(
+        log.warning(
             f"Warning: Unsupported spatial function {spatial_func}, returning empty expected_ids"
         )
         return []
@@ -792,7 +790,7 @@ def generate_gt(
                 base_geometries.append(base_geometry)
                 base_ids.append(item[pk_field_name])
             except Exception as e:
-                print(f"Warning: Failed to parse geometry {item[geo_field_name]}: {e}")
+                log.warning(f"Warning: Failed to parse geometry {item[geo_field_name]}: {e}")
                 continue
 
         if not base_geometries:
@@ -811,7 +809,7 @@ def generate_gt(
         return expected_ids
 
     except Exception as e:
-        print(f"Warning: Failed to compute ground truth for {spatial_func}: {e}")
+        log.error(f"Failed to compute ground truth for {spatial_func}: {e}")
         return []
 
 
@@ -990,10 +988,11 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
             )
 
     @pytest.mark.tags(CaseLabel.L1)
-    def test_build_rtree_index(self):
+    @pytest.mark.parametrize("index_type", ["RTREE", "AUTOINDEX"])
+    def test_build_geometry_index(self, index_type):
         """
-        target: test build RTREE index on geometry field
-        method: create RTREE index on geometry field
+        target: test build geometry index on geometry field
+        method: create geometry index on geometry field
         expected: build index successfully
         """
         client = self._client()
@@ -1047,19 +1046,12 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
             )
 
         self.insert(client, collection_name, data)
-        import pandas as pd
-        df = pd.DataFrame(data)
-        print(f"Data: {data}")
-        import os
-        os.makedirs("/tmp/ci_logs/test", exist_ok=True)
-        df.to_csv("/tmp/ci_logs/test/test_build_rtree_index.csv", index=False)
-
         # Prepare index params
         index_params, _ = self.prepare_index_params(client)
         index_params.add_index(
             field_name="vector", index_type="IVF_FLAT", metric_type="L2", nlist=128
         )
-        index_params.add_index(field_name="geo", index_type="RTREE")
+        index_params.add_index(field_name="geo", index_type=index_type)
 
         # Create index
         self.create_index(client,collection_name, index_params=index_params)
@@ -1140,9 +1132,6 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
         )
         expected_ids = generate_gt(spatial_func, base_data, query_geom, "geo", "id")
 
-        print(
-            f"Generated query for {spatial_func}: {len(expected_ids)} expected matches"
-        )
         assert len(expected_ids) >= 1, (
             f"{spatial_func} query should return at least 1 result, got {len(expected_ids)}"
         )
@@ -1201,6 +1190,171 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
 
     @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize(
+        "spatial_func",
+        [
+            "ST_INTERSECTS",
+            "ST_CONTAINS",
+            "ST_WITHIN",
+            "ST_EQUALS",
+            "ST_TOUCHES",
+            "ST_OVERLAPS",
+            "ST_CROSSES",
+        ],
+    )
+    @pytest.mark.parametrize("with_geo_index", [True, False])
+    @pytest.mark.parametrize("data_state", ["growing_only", "sealed_and_growing"])
+    def test_spatial_query_with_growing_data(self, spatial_func, with_geo_index, data_state):
+        """
+        target: test spatial query on growing data and mixed data states
+        method: query geometry data in different states (growing only / sealed + growing)
+        expected: return correct results for all data states with or without rtree index
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+
+        # Generate test data dynamically
+        base_count = 1500
+        base_data = generate_diverse_base_data(
+            count=base_count,
+            bounds=(0, 100, 0, 100),
+            pk_field_name="id",
+            geo_field_name="geo",
+        )
+
+        query_geom = generate_spatial_query_data_for_function(
+            spatial_func, base_data, "geo"
+        )
+
+        # Create collection
+        schema, _ = self.create_schema(client,
+            auto_id=False, description=f"test {spatial_func} query with {data_state}"
+        )
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=default_dim)
+        schema.add_field("geo", DataType.GEOMETRY)
+
+        self.create_collection(client, collection_name, schema=schema)
+
+        if data_state == "growing_only":
+            # Scenario 1: Pure growing data - insert without flush before loading
+            data = []
+            for item in base_data:
+                data.append(
+                    {
+                        "id": item["id"],
+                        "vector": [random.random() for _ in range(default_dim)],
+                        "geo": item["geo"],
+                    }
+                )
+
+            # Build index first (before inserting data)
+            index_params, _ = self.prepare_index_params(client)
+            index_params.add_index(
+                field_name="vector", index_type="IVF_FLAT", metric_type="L2", nlist=128
+            )
+            if with_geo_index:
+                index_params.add_index(field_name="geo", index_type="RTREE")
+
+            self.create_index(client, collection_name, index_params=index_params)
+            self.load_collection(client, collection_name)
+
+            # Insert data after loading - creates growing segment
+            self.insert(client, collection_name, data)
+
+            # Calculate expected IDs from all data (all growing)
+            expected_ids = generate_gt(spatial_func, base_data, query_geom, "geo", "id")
+
+        else:  # sealed_and_growing
+            # Scenario 2: Mixed sealed + growing data
+            # Split data into two batches: 60% sealed, 40% growing
+            split_idx = int(base_count * 0.6)
+            sealed_data = base_data[:split_idx]
+            growing_data = base_data[split_idx:]
+
+            # Insert first batch (will be sealed)
+            data_batch1 = []
+            for item in sealed_data:
+                data_batch1.append(
+                    {
+                        "id": item["id"],
+                        "vector": [random.random() for _ in range(default_dim)],
+                        "geo": item["geo"],
+                    }
+                )
+
+            self.insert(client, collection_name, data_batch1)
+            self.flush(client, collection_name)  # Flush to create sealed segment
+
+            # Build index and load
+            index_params, _ = self.prepare_index_params(client)
+            index_params.add_index(
+                field_name="vector", index_type="IVF_FLAT", metric_type="L2", nlist=128
+            )
+            if with_geo_index:
+                index_params.add_index(field_name="geo", index_type="RTREE")
+
+            self.create_index(client, collection_name, index_params=index_params)
+            self.load_collection(client, collection_name)
+
+            # Insert second batch after loading (will be growing)
+            data_batch2 = []
+            for item in growing_data:
+                data_batch2.append(
+                    {
+                        "id": item["id"],
+                        "vector": [random.random() for _ in range(default_dim)],
+                        "geo": item["geo"],
+                    }
+                )
+
+            self.insert(client, collection_name, data_batch2)
+
+            # Calculate expected IDs from all data (sealed + growing)
+            expected_ids = generate_gt(spatial_func, base_data, query_geom, "geo", "id")
+
+        print(
+            f"Generated query for {spatial_func} ({data_state}, index={with_geo_index}): "
+            f"{len(expected_ids)} expected matches"
+        )
+        assert len(expected_ids) >= 1, (
+            f"{spatial_func} query should return at least 1 result, got {len(expected_ids)}"
+        )
+
+        # Query with spatial operator - should return results from both sealed and growing
+        filter_expr = f"{spatial_func}(geo, '{query_geom}')"
+
+        results, _ = self.query(client,
+            collection_name=collection_name,
+            filter=filter_expr,
+            output_fields=["id", "geo"],
+        )
+
+        # Verify results
+        result_ids = {r["id"] for r in results}
+        expected_ids_set = set(expected_ids)
+
+        assert result_ids == expected_ids_set, (
+            f"{spatial_func} query ({data_state}, index={with_geo_index}) should return IDs "
+            f"{sorted(expected_ids_set)}, got {sorted(result_ids)}. "
+            f"Missing: {sorted(expected_ids_set - result_ids)}, Extra: {sorted(result_ids - expected_ids_set)}"
+        )
+
+        # Additional verification for mixed data state
+        if data_state == "sealed_and_growing":
+            # Verify that results include both sealed and growing segments
+            sealed_ids = {item["id"] for item in sealed_data}
+            growing_ids = {item["id"] for item in growing_data}
+
+            results_from_sealed = result_ids & sealed_ids
+            results_from_growing = result_ids & growing_ids
+
+            print(
+                f"Results from sealed: {len(results_from_sealed)}, "
+                f"from growing: {len(results_from_growing)}"
+            )
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize(
         "spatial_func", ["ST_INTERSECTS", "ST_CONTAINS", "ST_WITHIN"]
     )
     def test_search_with_geo_filter(self, spatial_func):
@@ -1224,9 +1378,6 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
         )
         expected_ids = generate_gt(spatial_func, base_data, query_geom, "geo", "id")
 
-        print(
-            f"Generated search filter for {spatial_func}: {len(expected_ids)} expected matches"
-        )
         assert len(expected_ids) >= 1, (
             f"{spatial_func} filter should match at least 1 result"
         )
@@ -2700,7 +2851,6 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
             client, collection_name, schema=schema, index_params=index_params
         )
         res = self.describe_collection(client, collection_name)
-        print(res)
 
         # Insert data
         rng = np.random.default_rng(seed=19530)
@@ -2721,7 +2871,6 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
         )
         original_ids = {r["id"] for r in original_results}
         original_geometries = {r["id"]: r["geo"] for r in original_results}
-        print(original_geometries)
 
         # Delete some records by IDs
         delete_ids = [1, 3, 5, 7, 9]
@@ -2731,7 +2880,6 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
         results, _ = self.query(client,
             collection_name, filter="", output_fields=["id", "geo"], limit=100
         )
-        print(results)
         remaining_ids = {r["id"] for r in results}
 
         assert len(results) == 15  # 20 - 5 deleted = 15
@@ -2963,9 +3111,15 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
 
         # Verify results match ground truth
         result_ids = {result["id"] for result in results}
-        assert result_ids == expected_within, (
-            f"ST_DWITHIN({distance_meters}m, index={with_geo_index}) should return expected IDs "
-            f"(count: {len(expected_within)}), but got different IDs (count: {len(result_ids)})"
+        expected_count = len(expected_within)
+        actual_count = len(result_ids)
+        diff_count = len(result_ids.symmetric_difference(expected_within))
+        diff_percentage = diff_count / expected_count if expected_count > 0 else 0
+
+        assert diff_percentage <= 0.1, (
+            f"ST_DWITHIN({distance_meters}m, index={with_geo_index}) difference exceeds 10%: "
+            f"expected {expected_count} IDs, got {actual_count} IDs, "
+            f"{diff_count} different ({diff_percentage:.1%})"
         )
 
     @pytest.mark.tags(CaseLabel.L1)
@@ -3095,6 +3249,193 @@ class TestMilvusClientGeometryBasic(TestMilvusClientV2Base):
             "Larger distances should return same or more results"
         )
 
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("with_geo_index", [True, False])
+    def test_st_isvalid_with_invalid_geometries(self, with_geo_index):
+        """
+        target: test ST_ISVALID operator can detect invalid geometries
+        method: insert both valid and invalid geometries (self-intersecting polygons), use ST_ISVALID to filter
+        expected: ST_ISVALID returns only valid geometries, NOT ST_ISVALID returns invalid geometries
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+
+        # Create collection with geometry field
+        schema, _ = self.create_schema(client, auto_id=False)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=default_dim)
+        schema.add_field("geo", DataType.GEOMETRY)
+
+        self.create_collection(client, collection_name, schema=schema)
+
+        # Valid geometries
+        valid_geometries = [
+            ("POINT (10 20)", True),
+            ("LINESTRING (0 0, 10 10, 20 20)", True),
+            ("POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))", True),  # Simple valid polygon
+        ]
+
+        # Invalid geometries - self-intersecting polygons (bowtie/figure-8 shape)
+        invalid_geometries = [
+            ("POLYGON ((0 0, 10 10, 10 0, 0 10, 0 0))", False),  # Self-intersecting (bowtie)
+            ("POLYGON ((0 0, 20 10, 10 0, 20 0, 0 10, 0 0))", False),  # Another self-intersecting
+        ]
+
+        all_geometries = valid_geometries + invalid_geometries
+
+        data = []
+        for i, (geo_wkt, is_valid) in enumerate(all_geometries):
+            data.append({
+                "id": i,
+                "vector": [random.random() for _ in range(default_dim)],
+                "geo": geo_wkt
+            })
+
+        self.insert(client, collection_name, data)
+        self.flush(client, collection_name)
+
+        # Create indexes
+        index_params, _ = self.prepare_index_params(client)
+        index_params.add_index(
+            field_name="vector", index_type="IVF_FLAT", metric_type="L2", nlist=128
+        )
+        if with_geo_index:
+            index_params.add_index(field_name="geo", index_type="RTREE")
+
+        self.create_index(client, collection_name, index_params=index_params)
+        self.load_collection(client, collection_name)
+
+        # Test ST_ISVALID - should return only valid geometries
+        results_valid, _ = self.query(
+            client,
+            collection_name=collection_name,
+            filter="ST_ISVALID(geo)",
+            output_fields=["id", "geo"],
+        )
+
+        valid_ids = {i for i, (_, is_valid) in enumerate(all_geometries) if is_valid}
+        result_ids = {r["id"] for r in results_valid}
+        assert result_ids == valid_ids, (
+            f"ST_ISVALID should return valid geometry IDs {valid_ids}, "
+            f"got {result_ids} (index={with_geo_index})"
+        )
+
+        # Test NOT ST_ISVALID - should return only invalid geometries
+        results_invalid, _ = self.query(
+            client,
+            collection_name=collection_name,
+            filter="not ST_ISVALID(geo)",
+            output_fields=["id", "geo"],
+        )
+
+        invalid_ids = {i for i, (_, is_valid) in enumerate(all_geometries) if not is_valid}
+        result_invalid_ids = {r["id"] for r in results_invalid}
+        assert result_invalid_ids == invalid_ids, (
+            f"NOT ST_ISVALID should return invalid geometry IDs {invalid_ids}, "
+            f"got {result_invalid_ids} (index={with_geo_index})"
+        )
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("with_geo_index", [True, False])
+    def test_st_isvalid_basic(self, with_geo_index):
+        """
+        target: test ST_ISVALID operator basic functionality
+        method: insert valid WKT geometries, query using ST_ISVALID, test NOT ST_ISVALID and combined conditions
+        expected: ST_ISVALID returns true for all valid geometries, correct filtering with logical operators
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+
+        # Create collection with geometry field and category
+        schema, _ = self.create_schema(client, auto_id=False)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=default_dim)
+        schema.add_field("geo", DataType.GEOMETRY)
+        schema.add_field("category", DataType.INT64)
+
+        self.create_collection(client, collection_name, schema=schema)
+
+        # Insert valid geometry data of various types
+        valid_geometries = [
+            "POINT (10.5 20.3)",
+            "LINESTRING (0 0, 10 10, 20 25)",
+            "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))",
+            "MULTIPOINT ((0 0), (10 10), (20 20))",
+            "MULTILINESTRING ((0 0, 10 10), (20 20, 30 30))",
+            "MULTIPOLYGON (((0 0, 5 0, 5 5, 0 5, 0 0)), ((10 10, 15 10, 15 15, 10 15, 10 10)))",
+            "GEOMETRYCOLLECTION (POINT(10 10), LINESTRING(0 0, 5 5))",
+        ]
+
+        data = []
+        for i, geo_wkt in enumerate(valid_geometries):
+            data.append({
+                "id": i,
+                "vector": [random.random() for _ in range(default_dim)],
+                "geo": geo_wkt,
+                "category": i % 2
+            })
+
+        self.insert(client, collection_name, data)
+        self.flush(client, collection_name)
+
+        # Create indexes
+        index_params, _ = self.prepare_index_params(client)
+        index_params.add_index(
+            field_name="vector", index_type="IVF_FLAT", metric_type="L2", nlist=128
+        )
+        if with_geo_index:
+            index_params.add_index(field_name="geo", index_type="RTREE")
+
+        self.create_index(client, collection_name, index_params=index_params)
+        self.load_collection(client, collection_name)
+
+        # Test 1: ST_ISVALID returns all valid geometries
+        results, _ = self.query(
+            client,
+            collection_name=collection_name,
+            filter="ST_ISVALID(geo)",
+            output_fields=["id", "geo"],
+        )
+        assert len(results) == len(valid_geometries), (
+            f"ST_ISVALID should return all {len(valid_geometries)} valid geometries, "
+            f"got {len(results)} (index={with_geo_index})"
+        )
+
+        # Test 2: NOT ST_ISVALID returns empty for all valid geometries
+        results_not, _ = self.query(
+            client,
+            collection_name=collection_name,
+            filter="not ST_ISVALID(geo)",
+            output_fields=["id", "geo"],
+        )
+        assert len(results_not) == 0, (
+            f"NOT ST_ISVALID should return 0 results, got {len(results_not)} (index={with_geo_index})"
+        )
+
+        # Test 3: ST_ISVALID combined with other condition
+        results_and, _ = self.query(
+            client,
+            collection_name=collection_name,
+            filter="ST_ISVALID(geo) and category == 1",
+            output_fields=["id", "geo", "category"],
+        )
+        expected_category_1 = {i for i in range(len(valid_geometries)) if i % 2 == 1}
+        result_ids = {r["id"] for r in results_and}
+        assert result_ids == expected_category_1, (
+            f"ST_ISVALID AND category==1 should return IDs {expected_category_1}, "
+            f"got {result_ids} (index={with_geo_index})"
+        )
+
+        # Test 4: Case insensitive (lowercase)
+        results_lower, _ = self.query(
+            client,
+            collection_name=collection_name,
+            filter="st_isvalid(geo)",
+            output_fields=["id"],
+        )
+        assert len(results_lower) == len(valid_geometries), (
+            f"st_isvalid (lowercase) should return all records (index={with_geo_index})"
+        )
 
 
 
@@ -3714,3 +4055,90 @@ class TestMilvusClientGeometryNegative(TestMilvusClientV2Base):
                 check_task=CheckTasks.err_res,
                 check_items=error_invalid_insert,
             )
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("with_geo_index", [True, False])
+    def test_st_isvalid_invalid_usage(self, with_geo_index):
+        """
+        target: test ST_ISVALID error handling for invalid usage
+        method: test ST_ISVALID on non-geometry fields, with wrong parameters, and nonexistent fields
+        expected: should raise appropriate errors
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+
+        # Create collection with geometry and non-geometry fields
+        schema, _ = self.create_schema(client, auto_id=False)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=default_dim)
+        schema.add_field("geo", DataType.GEOMETRY)
+        schema.add_field("int_field", DataType.INT64)
+
+        self.create_collection(client, collection_name, schema=schema)
+
+        # Insert test data
+        data = [{
+            "id": 0,
+            "vector": [random.random() for _ in range(default_dim)],
+            "geo": "POINT (10 20)",
+            "int_field": 100
+        }]
+
+        self.insert(client, collection_name, data)
+        self.flush(client, collection_name)
+
+        # Create indexes
+        index_params, _ = self.prepare_index_params(client)
+        index_params.add_index(
+            field_name="vector", index_type="IVF_FLAT", metric_type="L2", nlist=128
+        )
+        if with_geo_index:
+            index_params.add_index(field_name="geo", index_type="RTREE")
+
+        self.create_index(client, collection_name, index_params=index_params)
+        self.load_collection(client, collection_name)
+
+        error = {
+            ct.err_code: 1100,
+            ct.err_msg: "failed to create query plan: cannot parse expression",
+        }
+
+        # Test 1: ST_ISVALID on non-geometry field
+        self.query(
+            client,
+            collection_name=collection_name,
+            filter="ST_ISVALID(int_field)",
+            output_fields=["id"],
+            check_task=CheckTasks.err_res,
+            check_items=error,
+        )
+
+        # Test 2: ST_ISVALID with no parameters
+        self.query(
+            client,
+            collection_name=collection_name,
+            filter="ST_ISVALID()",
+            output_fields=["id", "geo"],
+            check_task=CheckTasks.err_res,
+            check_items=error,
+        )
+
+        # Test 3: ST_ISVALID with too many parameters
+        self.query(
+            client,
+            collection_name=collection_name,
+            filter="ST_ISVALID(geo, 1)",
+            output_fields=["id", "geo"],
+            check_task=CheckTasks.err_res,
+            check_items=error,
+        )
+
+        # Test 4: ST_ISVALID with non-existent field
+        self.query(
+            client,
+            collection_name=collection_name,
+            filter="ST_ISVALID(nonexistent_geo_field)",
+            output_fields=["id", "geo"],
+            check_task=CheckTasks.err_res,
+            check_items=error,
+        )

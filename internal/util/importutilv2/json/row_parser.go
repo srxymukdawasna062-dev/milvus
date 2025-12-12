@@ -27,9 +27,9 @@ import (
 	"github.com/milvus-io/milvus/internal/util/importutilv2/common"
 	"github.com/milvus-io/milvus/internal/util/nullutil"
 	pkgcommon "github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/parameterutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -45,7 +45,7 @@ type rowParser struct {
 	dynamicField         *schemapb.FieldSchema
 	functionOutputFields map[string]int64
 
-	structArrays      map[string]interface{}
+	structArrays      map[string][]string
 	allowInsertAutoID bool
 
 	timezone string
@@ -89,10 +89,14 @@ func NewRowParser(schema *schemapb.CollectionSchema) (RowParser, error) {
 	)
 	allowInsertAutoID, _ := pkgcommon.IsAllowInsertAutoID(schema.GetProperties()...)
 
-	sturctArrays := lo.SliceToMap(
+	structArrays := lo.SliceToMap(
 		schema.GetStructArrayFields(),
-		func(sa *schemapb.StructArrayFieldSchema) (string, interface{}) {
-			return sa.GetName(), nil
+		func(sa *schemapb.StructArrayFieldSchema) (string, []string) {
+			subFieldNames := lo.Map(sa.Fields, func(field *schemapb.FieldSchema, _ int) string {
+				fieldName, _ := typeutil.ExtractStructFieldName(field.GetName())
+				return fieldName
+			})
+			return sa.GetName(), subFieldNames
 		},
 	)
 
@@ -103,7 +107,7 @@ func NewRowParser(schema *schemapb.CollectionSchema) (RowParser, error) {
 		pkField:              pkField,
 		dynamicField:         dynamicField,
 		functionOutputFields: functionOutputFields,
-		structArrays:         sturctArrays,
+		structArrays:         structArrays,
 		allowInsertAutoID:    allowInsertAutoID,
 		timezone:             common.GetSchemaTimezone(schema),
 	}, nil
@@ -221,10 +225,18 @@ func (r *rowParser) Parse(raw any) (Row, error) {
 			return nil, merr.WrapErrImportFailed(fmt.Sprintf("the field '%s' is output by function, no need to provide", key))
 		}
 
-		if _, ok := r.structArrays[key]; ok {
+		if subFieldNames, ok := r.structArrays[key]; ok {
 			values, err := reconstructArrayForStructArray(value)
 			if err != nil {
 				return nil, err
+			}
+
+			// a struct list can be empty, the values could be an empty map
+			// make an empty list for each sub field
+			if len(values) == 0 {
+				for i := 0; i < len(subFieldNames); i++ {
+					values[subFieldNames[i]] = make([]any, 0)
+				}
 			}
 
 			for subKey, subValue := range values {
@@ -571,7 +583,7 @@ func (r *rowParser) parseEntity(fieldID int64, obj any) (any, error) {
 		if !ok {
 			return nil, r.wrapTypeError(obj, fieldID)
 		}
-		tz, err := funcutil.ValidateAndReturnUnixMicroTz(strValue, r.timezone)
+		tz, err := timestamptz.ValidateAndReturnUnixMicroTz(strValue, r.timezone)
 		if err != nil {
 			return nil, err
 		}

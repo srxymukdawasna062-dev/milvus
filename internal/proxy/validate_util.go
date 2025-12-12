@@ -7,7 +7,6 @@ import (
 
 	"github.com/samber/lo"
 	"github.com/twpayne/go-geom/encoding/wkb"
-	"github.com/twpayne/go-geom/encoding/wkbcommon"
 	"github.com/twpayne/go-geom/encoding/wkt"
 	"go.uber.org/zap"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/parameterutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -56,6 +56,9 @@ func withMaxCapCheck() validateOption {
 }
 
 func validateGeometryFieldSearchResult(fieldData **schemapb.FieldData) error {
+	if *fieldData == nil || (*fieldData).GetScalars() == nil || (*fieldData).GetScalars().Data == nil {
+		return nil
+	}
 	// Check if the field data already contains GeometryWktData
 	_, ok := (*fieldData).GetScalars().Data.(*schemapb.ScalarField_GeometryWktData)
 	if ok {
@@ -590,7 +593,7 @@ func FillWithDefaultValue(field *schemapb.FieldData, fieldSchema *schemapb.Field
 					// as UTC/the collection's primary timezone, the 'common.DefaultTimezone' passed here
 					// as the fallback timezone is generally inconsequential (negligible)
 					// for the final conversion result in this specific context.
-					defaultValue, _ = funcutil.ValidateAndReturnUnixMicroTz(strDefaultValue, common.DefaultTimezone)
+					defaultValue, _ = timestamptz.ValidateAndReturnUnixMicroTz(strDefaultValue, common.DefaultTimezone)
 				}
 			}
 			sd.TimestamptzData.Data, err = fillWithDefaultValueImpl(sd.TimestamptzData.Data, defaultValue, field.GetValidData())
@@ -847,16 +850,11 @@ func (v *validateUtil) checkGeometryFieldData(field *schemapb.FieldData, fieldSc
 		msg := fmt.Sprintf("geometry field '%v' is illegal, array type mismatch", field.GetFieldName())
 		return merr.WrapErrParameterInvalid("need geometry array", "got nil", msg)
 	}
-
+	var err error
 	for index, wktdata := range geometryArray {
 		// ignore parsed geom, the check is during insert task pre execute,so geo data became wkb
 		// fmt.Println(strings.Trim(string(wktdata), "\""))
-		geomT, err := wkt.Unmarshal(wktdata)
-		if err != nil {
-			log.Warn("insert invalid Geometry data!! The wkt data has errors", zap.Error(err))
-			return merr.WrapErrIoFailedReason(err.Error())
-		}
-		wkbArray[index], err = wkb.Marshal(geomT, wkb.NDR, wkbcommon.WKBOptionEmptyPointHandling(wkbcommon.EmptyPointHandlingNaN))
+		wkbArray[index], err = common.ConvertWKTToWKB(wktdata)
 		if err != nil {
 			log.Warn("insert invalid Geometry data!! Transform to wkb failed, has errors", zap.Error(err))
 			return merr.WrapErrIoFailedReason(err.Error())
@@ -1165,10 +1163,10 @@ func (v *validateUtil) checkTimestamptzFieldData(field *schemapb.FieldData, time
 
 	// 2. Validation and Conversion Loop
 	for i, isoStr := range stringData {
-		// Use the centralized parser (funcutil.ParseTimeTz) for validation and parsing.
-		t, err := funcutil.ParseTimeTz(isoStr, timezone)
+		// Use the centralized parser (timestamptz.ParseTimeTz) for validation and parsing.
+		t, err := timestamptz.ParseTimeTz(isoStr, timezone)
 		if err != nil {
-			log.Warn("cannot parse timestamptz string", zap.String("timestamp_string", isoStr), zap.Error(err))
+			log.Info("cannot parse timestamptz string", zap.String("timestamp_string", isoStr), zap.String("timezone", timezone), zap.Error(err))
 			// Use the recommended refined error message structure
 			const invalidMsg = "invalid timezone name; must be a valid IANA Time Zone ID (e.g., 'Asia/Shanghai' or 'UTC')"
 			return merr.WrapErrParameterInvalidMsg("got invalid timestamptz string '%s': %s", isoStr, invalidMsg)

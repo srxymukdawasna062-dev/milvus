@@ -499,7 +499,7 @@ generate-mockery-querycoord: getdeps
 	$(INSTALL_PATH)/mockery --config $(PWD)/internal/querycoordv2/.mockery.yaml
 
 generate-mockery-querynode-without-cpp:
-	@source $(PWD)/scripts/setenv.sh
+	@source $(PWD)/scripts/setenv.sh && \
 	$(INSTALL_PATH)/mockery --config $(PWD)/internal/querynodev2/.mockery.yaml
 
 generate-mockery-querynode: build-cpp generate-mockery-querynode-without-cpp
@@ -520,6 +520,7 @@ generate-mockery-flushcommon: getdeps
 	$(INSTALL_PATH)/mockery --name=WriteBuffer --dir=$(PWD)/internal/flushcommon/writebuffer --output=$(PWD)/internal/flushcommon/writebuffer --filename=mock_write_buffer.go --with-expecter --structname=MockWriteBuffer --outpkg=writebuffer --inpackage
 	$(INSTALL_PATH)/mockery --name=BufferManager --dir=$(PWD)/internal/flushcommon/writebuffer --output=$(PWD)/internal/flushcommon/writebuffer --filename=mock_manager.go --with-expecter --structname=MockBufferManager --outpkg=writebuffer --inpackage
 	$(INSTALL_PATH)/mockery --name=BinlogIO --dir=$(PWD)/internal/flushcommon/io --output=$(PWD)/internal/mocks/flushcommon/mock_util --filename=mock_binlogio.go --with-expecter --structname=MockBinlogIO --outpkg=mock_util --inpackage=false
+	$(INSTALL_PATH)/mockery --name=MsgHandler --dir=$(PWD)/internal/flushcommon/util --output=$(PWD)/internal/mocks/flushcommon/mock_util --filename=mock_MsgHandler.go --with-expecter --structname=MockMsgHandler --outpkg=mock_util --inpackage=false
 	$(INSTALL_PATH)/mockery --name=FlowgraphManager --dir=$(PWD)/internal/flushcommon/pipeline --output=$(PWD)/internal/flushcommon/pipeline --filename=mock_fgmanager.go --with-expecter --structname=MockFlowgraphManager --outpkg=pipeline --inpackage
 
 generate-mockery-metastore: getdeps
@@ -533,6 +534,7 @@ generate-mockery-utils: getdeps
 	# tso.Allocator
 	$(INSTALL_PATH)/mockery --name=Allocator --dir=internal/tso --output=internal/tso/mocks --filename=allocator.go --with-expecter --structname=Allocator --outpkg=mocktso
 	$(INSTALL_PATH)/mockery --name=SessionInterface --dir=$(PWD)/internal/util/sessionutil --output=$(PWD)/internal/util/sessionutil --filename=mock_session.go --with-expecter --structname=MockSession --inpackage
+	$(INSTALL_PATH)/mockery --name=SessionWatcher --dir=$(PWD)/internal/util/sessionutil --output=$(PWD)/internal/util/sessionutil --filename=mock_session_watcher.go --with-expecter --structname=MockSessionWatcher --inpackage
 	$(INSTALL_PATH)/mockery --name=GrpcClient --dir=$(PWD)/internal/util/grpcclient --output=$(PWD)/internal/mocks --filename=mock_grpc_client.go --with-expecter --structname=MockGrpcClient
 	# proxy_client_manager.go
 	$(INSTALL_PATH)/mockery --name=ProxyClientManagerInterface --dir=$(PWD)/internal/util/proxyutil --output=$(PWD)/internal/util/proxyutil --filename=mock_proxy_client_manager.go --with-expecter --structname=MockProxyClientManager --inpackage
@@ -557,10 +559,13 @@ generate-mockery-pkg:
 generate-mockery-internal: getdeps
 	$(INSTALL_PATH)/mockery --config $(PWD)/internal/.mockery.yaml
 
+generate-mockery-client:
+	$(MAKE) -C client generate-mockery
+
 generate-mockery-cdc: getdeps
 	$(INSTALL_PATH)/mockery --config $(PWD)/internal/cdc/.mockery.yaml
 
-generate-mockery: generate-mockery-types generate-mockery-kv generate-mockery-rootcoord generate-mockery-proxy generate-mockery-querycoord generate-mockery-querynode generate-mockery-datacoord generate-mockery-pkg generate-mockery-internal
+generate-mockery: generate-mockery-types generate-mockery-kv generate-mockery-rootcoord generate-mockery-proxy generate-mockery-querycoord generate-mockery-querynode generate-mockery-datacoord generate-mockery-pkg generate-mockery-internal generate-mockery-client
 
 generate-yaml: milvus-tools
 	@echo "Updating milvus config yaml"

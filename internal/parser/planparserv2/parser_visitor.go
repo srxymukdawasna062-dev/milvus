@@ -12,12 +12,30 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	parser "github.com/milvus-io/milvus/internal/parser/planparserv2/generated"
 	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type ParserVisitorArgs struct {
 	Timezone string
+}
+
+// int64OverflowError is a special error type used to handle the case where
+// 9223372036854775808 (which exceeds int64 max) is used with unary minus
+// to represent -9223372036854775808 (int64 minimum value).
+// This happens because ANTLR parses -9223372036854775808 as Unary(SUB, Integer(9223372036854775808)),
+// causing the integer literal to exceed int64 range before the unary minus is applied.
+type int64OverflowError struct {
+	literal string
+}
+
+func (e *int64OverflowError) Error() string {
+	return fmt.Sprintf("int64 overflow: %s", e.literal)
+}
+
+func isInt64OverflowError(err error) bool {
+	_, ok := err.(*int64OverflowError)
+	return ok
 }
 
 type ParserVisitor struct {
@@ -108,6 +126,15 @@ func (v *ParserVisitor) VisitInteger(ctx *parser.IntegerContext) interface{} {
 	literal := ctx.IntegerConstant().GetText()
 	i, err := strconv.ParseInt(literal, 0, 64)
 	if err != nil {
+		// Special case: 9223372036854775808 is out of int64 range,
+		// but -9223372036854775808 is valid (int64 minimum value).
+		// This happens because ANTLR parses -9223372036854775808 as:
+		//   Unary(SUB, Integer(9223372036854775808))
+		// The integer literal 9223372036854775808 exceeds int64 max (9223372036854775807)
+		// before the unary minus is applied. We handle this in VisitUnary.
+		if literal == "9223372036854775808" {
+			return &int64OverflowError{literal: literal}
+		}
 		return err
 	}
 	return &ExprWithType{
@@ -950,6 +977,23 @@ func (v *ParserVisitor) VisitReverseRange(ctx *parser.ReverseRangeContext) inter
 func (v *ParserVisitor) VisitUnary(ctx *parser.UnaryContext) interface{} {
 	child := ctx.Expr().Accept(v)
 	if err := getError(child); err != nil {
+		// Special case: handle -9223372036854775808
+		// ANTLR parses -9223372036854775808 as Unary(SUB, Integer(9223372036854775808)).
+		// The integer literal 9223372036854775808 exceeds int64 max, but when combined
+		// with unary minus, it represents the valid int64 minimum value.
+		if isInt64OverflowError(err) && ctx.GetOp().GetTokenType() == parser.PlanParserSUB {
+			return &ExprWithType{
+				dataType: schemapb.DataType_Int64,
+				expr: &planpb.Expr{
+					Expr: &planpb.Expr_ValueExpr{
+						ValueExpr: &planpb.ValueExpr{
+							Value: NewInt(math.MinInt64),
+						},
+					},
+				},
+				nodeDependent: true,
+			}
+		}
 		return err
 	}
 
@@ -1688,6 +1732,31 @@ func (v *ParserVisitor) VisitSTEuqals(ctx *parser.STEuqalsContext) interface{} {
 	}
 }
 
+func (v *ParserVisitor) VisitSTIsValid(ctx *parser.STIsValidContext) interface{} {
+	childExpr, err := v.translateIdentifier(ctx.Identifier().GetText())
+	if err != nil {
+		return err
+	}
+	columnInfo := toColumnInfo(childExpr)
+	if columnInfo == nil ||
+		(!typeutil.IsGeometryType(columnInfo.GetDataType())) {
+		return fmt.Errorf(
+			"STIsValid operation are only supported on geometry fields now, got: %s", ctx.GetText())
+	}
+	expr := &planpb.Expr{
+		Expr: &planpb.Expr_GisfunctionFilterExpr{
+			GisfunctionFilterExpr: &planpb.GISFunctionFilterExpr{
+				ColumnInfo: columnInfo,
+				Op:         planpb.GISFunctionFilterExpr_STIsValid,
+			},
+		},
+	}
+	return &ExprWithType{
+		expr:     expr,
+		dataType: schemapb.DataType_Bool,
+	}
+}
+
 func (v *ParserVisitor) VisitSTTouches(ctx *parser.STTouchesContext) interface{} {
 	childExpr, err := v.translateIdentifier(ctx.Identifier().GetText())
 	if err != nil {
@@ -1988,7 +2057,7 @@ func (v *ParserVisitor) VisitTimestamptzCompareForward(ctx *parser.TimestamptzCo
 
 	compareOp := cmpOpMap[ctx.GetOp2().GetTokenType()]
 
-	timestamptzInt64, err := funcutil.ValidateAndReturnUnixMicroTz(unquotedCompareStr, v.args.Timezone)
+	timestamptzInt64, err := timestamptz.ValidateAndReturnUnixMicroTz(unquotedCompareStr, v.args.Timezone)
 	if err != nil {
 		return err
 	}
@@ -2052,7 +2121,7 @@ func (v *ParserVisitor) VisitTimestamptzCompareReverse(ctx *parser.TimestamptzCo
 		return fmt.Errorf("unsupported comparison operator for reverse Timestamptz: %s", ctx.GetOp2().GetText())
 	}
 
-	timestamptzInt64, err := funcutil.ValidateAndReturnUnixMicroTz(unquotedCompareStr, v.args.Timezone)
+	timestamptzInt64, err := timestamptz.ValidateAndReturnUnixMicroTz(unquotedCompareStr, v.args.Timezone)
 	if err != nil {
 		return err
 	}

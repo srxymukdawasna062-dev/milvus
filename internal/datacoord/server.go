@@ -141,11 +141,10 @@ type Server struct {
 	notifyIndexChan chan UniqueID
 	factory         dependency.Factory
 
-	session   sessionutil.SessionInterface
-	icSession sessionutil.SessionInterface
-	dnEventCh <-chan *sessionutil.SessionEvent
-	// qcEventCh <-chan *sessionutil.SessionEvent
-	qnEventCh <-chan *sessionutil.SessionEvent
+	session          sessionutil.SessionInterface
+	icSession        sessionutil.SessionInterface
+	dnSessionWatcher sessionutil.SessionWatcher
+	qnSessionWatcher sessionutil.SessionWatcher
 
 	enableActiveStandBy bool
 	activateFunc        func() error
@@ -157,15 +156,19 @@ type Server struct {
 	// segReferManager  *SegmentReferenceManager
 	indexEngineVersionManager IndexEngineVersionManager
 
-	statsInspector   *statsInspector
-	indexInspector   *indexInspector
-	analyzeInspector *analyzeInspector
-	globalScheduler  task.GlobalScheduler
+	statsInspector              *statsInspector
+	indexInspector              *indexInspector
+	analyzeInspector            *analyzeInspector
+	externalCollectionInspector *externalCollectionInspector
+	globalScheduler             task.GlobalScheduler
 
 	// manage ways that data coord access other coord
 	broker broker.Broker
 
 	metricsRequest *metricsinfo.MetricsRequest
+
+	// file resource
+	fileManager *FileResourceManager
 }
 
 type CollectionNameInfo struct {
@@ -232,7 +235,7 @@ func (s *Server) Register() error {
 }
 
 func (s *Server) ServerExist(serverID int64) bool {
-	sessions, _, err := s.session.GetSessions(typeutil.DataNodeRole)
+	sessions, _, err := s.session.GetSessions(s.ctx, typeutil.DataNodeRole)
 	if err != nil {
 		log.Ctx(s.ctx).Warn("failed to get sessions", zap.Error(err))
 		return false
@@ -322,6 +325,10 @@ func (s *Server) initDataCoord() error {
 	s.initStatsInspector()
 	log.Info("init statsJobManager done")
 
+	// TODO: enable external collection inspector
+	// s.initExternalCollectionInspector()
+	// log.Info("init external collection inspector done")
+
 	if err = s.initSegmentManager(); err != nil {
 		return err
 	}
@@ -332,6 +339,8 @@ func (s *Server) initDataCoord() error {
 	s.importInspector = NewImportInspector(s.ctx, s.meta, s.importMeta, s.globalScheduler)
 
 	s.importChecker = NewImportChecker(s.ctx, s.meta, s.broker, s.allocator, s.importMeta, s.compactionInspector, s.handler, s.compactionTriggerManager)
+
+	s.fileManager = NewFileResourceManager(s.ctx, s.meta, s.nodeManager)
 
 	s.serverLoopCtx, s.serverLoopCancel = context.WithCancel(s.ctx)
 
@@ -347,6 +356,9 @@ func (s *Server) initDataCoord() error {
 func (s *Server) initMessageCallback() {
 	registry.RegisterImportV1AckCallback(func(ctx context.Context, result message.BroadcastResultImportMessageV1) error {
 		body := result.Message.MustBody()
+		if body.Schema != nil {
+			body.Schema.DbName = body.DbName
+		}
 		vchannels := result.GetVChannelsWithoutControlChannel()
 		importResp, err := s.ImportV2(ctx, &internalpb.ImportRequestInternal{
 			CollectionID:   body.GetCollectionID(),
@@ -425,7 +437,8 @@ func (s *Server) Start() error {
 func (s *Server) startDataCoord() {
 	s.startTaskScheduler()
 	s.startServerLoop()
-
+	s.fileManager.Start()
+	s.fileManager.Notify()
 	s.afterStart()
 	s.UpdateStateCode(commonpb.StateCode_Healthy)
 	sessionutil.SaveServerInfo(typeutil.MixCoordRole, s.session.GetServerID())
@@ -521,6 +534,7 @@ func (s *Server) initServiceDiscovery() error {
 			log.Warn("DataCoord failed to add datanode", zap.Error(err))
 			return err
 		}
+		s.dnSessionWatcher = sessionutil.EmptySessionWatcher()
 	} else {
 		err := s.rewatchDataNodes(sessions)
 		if err != nil {
@@ -529,17 +543,17 @@ func (s *Server) initServiceDiscovery() error {
 		}
 		log.Info("DataCoord Cluster Manager start up successfully")
 
-		s.dnEventCh = s.session.WatchServicesWithVersionRange(typeutil.DataNodeRole, r, rev+1, s.rewatchDataNodes)
+		s.dnSessionWatcher = s.session.WatchServicesWithVersionRange(typeutil.DataNodeRole, r, rev+1, s.rewatchDataNodes)
 	}
 
 	s.indexEngineVersionManager = newIndexEngineVersionManager()
-	qnSessions, qnRevision, err := s.session.GetSessions(typeutil.QueryNodeRole)
+	qnSessions, qnRevision, err := s.session.GetSessions(s.ctx, typeutil.QueryNodeRole)
 	if err != nil {
 		log.Warn("DataCoord get QueryNode sessions failed", zap.Error(err))
 		return err
 	}
 	s.rewatchQueryNodes(qnSessions)
-	s.qnEventCh = s.session.WatchServicesWithVersionRange(typeutil.QueryNodeRole, r, qnRevision+1, s.rewatchQueryNodes)
+	s.qnSessionWatcher = s.session.WatchServicesWithVersionRange(typeutil.QueryNodeRole, r, qnRevision+1, s.rewatchQueryNodes)
 
 	return nil
 }
@@ -672,6 +686,12 @@ func (s *Server) initStatsInspector() {
 	}
 }
 
+func (s *Server) initExternalCollectionInspector() {
+	if s.externalCollectionInspector == nil {
+		s.externalCollectionInspector = newExternalCollectionInspector(s.ctx, s.meta, s.globalScheduler, s.allocator)
+	}
+}
+
 func (s *Server) initCompaction() {
 	cph := newCompactionInspector(s.meta, s.allocator, s.handler, s.globalScheduler, s.indexEngineVersionManager)
 	cph.loadMeta()
@@ -747,6 +767,8 @@ func (s *Server) startTaskScheduler() {
 	s.statsInspector.Start()
 	s.indexInspector.Start()
 	s.analyzeInspector.Start()
+	// TODO: enable external collection inspector
+	// s.externalCollectionInspector.Start()
 	s.startCollectMetaMetrics(s.serverLoopCtx)
 }
 
@@ -796,7 +818,7 @@ func (s *Server) watchService(ctx context.Context) {
 		case <-ctx.Done():
 			log.Info("watch service shutdown")
 			return
-		case event, ok := <-s.dnEventCh:
+		case event, ok := <-s.dnSessionWatcher.EventChannel():
 			if !ok {
 				s.stopServiceWatch()
 				return
@@ -809,7 +831,7 @@ func (s *Server) watchService(ctx context.Context) {
 				}()
 				return
 			}
-		case event, ok := <-s.qnEventCh:
+		case event, ok := <-s.qnSessionWatcher.EventChannel():
 			if !ok {
 				s.stopServiceWatch()
 				return
@@ -852,7 +874,14 @@ func (s *Server) handleSessionEvent(ctx context.Context, role string, event *ses
 					zap.String("event type", event.EventType.String()))
 				return nil
 			}
-			return s.nodeManager.AddNode(event.Session.ServerID, event.Session.Address)
+			err := s.nodeManager.AddNode(event.Session.ServerID, event.Session.Address)
+			if err != nil {
+				return err
+			}
+
+			// notify file manager sync file resource to new node
+			s.fileManager.Notify()
+			return nil
 		case sessionutil.SessionDelEvent:
 			log.Info("received datanode unregister",
 				zap.String("address", info.Address),
@@ -1035,6 +1064,7 @@ func (s *Server) Stop() error {
 	s.stopServerLoop()
 	log.Info("datacoord stopServerLoop stopped")
 
+	s.fileManager.Close()
 	s.globalScheduler.Stop()
 	s.importInspector.Close()
 	s.importChecker.Close()
@@ -1050,6 +1080,17 @@ func (s *Server) Stop() error {
 
 	s.analyzeInspector.Stop()
 	log.Info("datacoord analyze inspector stopped")
+
+	if s.dnSessionWatcher != nil {
+		s.dnSessionWatcher.Stop()
+	}
+
+	if s.qnSessionWatcher != nil {
+		s.qnSessionWatcher.Stop()
+	}
+	// TODO: enable external collection inspector
+	// s.externalCollectionInspector.Stop()
+	// log.Info("datacoord external collection inspector stopped")
 
 	if s.session != nil {
 		s.session.Stop()

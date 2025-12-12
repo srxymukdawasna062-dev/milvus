@@ -38,6 +38,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/tasks"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/analyzer"
+	"github.com/milvus-io/milvus/internal/util/fileresource"
 	"github.com/milvus-io/milvus/internal/util/searchutil/scheduler"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
 	"github.com/milvus-io/milvus/pkg/v2/common"
@@ -877,13 +878,8 @@ func (node *QueryNode) Search(ctx context.Context, req *querypb.SearchRequest) (
 		return resp, nil
 	}
 
-	tr.RecordSpan()
 	ret.Status = merr.Success()
 
-	reduceLatency := tr.RecordSpan()
-	metrics.QueryNodeReduceLatency.
-		WithLabelValues(fmt.Sprint(node.GetNodeID()), metrics.SearchLabel, metrics.ReduceShards, metrics.BatchReduce).
-		Observe(float64(reduceLatency.Milliseconds()))
 	metrics.QueryNodeExecuteCounter.WithLabelValues(strconv.FormatInt(node.GetNodeID(), 10), metrics.SearchLabel).
 		Add(float64(proto.Size(req)))
 
@@ -1661,10 +1657,10 @@ func (node *QueryNode) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzer
 	}, nil
 }
 
-func (node *QueryNode) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*commonpb.Status, error) {
+func (node *QueryNode) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*querypb.ValidateAnalyzerResponse, error) {
 	// check node healthy
 	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
-		return merr.Status(err), nil
+		return &querypb.ValidateAnalyzerResponse{Status: merr.Status(err)}, nil
 	}
 	defer node.lifetime.Done()
 
@@ -1672,13 +1668,13 @@ func (node *QueryNode) ValidateAnalyzer(ctx context.Context, req *querypb.Valida
 		err := analyzer.ValidateAnalyzer(info.GetParams())
 		if err != nil {
 			if info.GetName() != "" {
-				return merr.Status(merr.WrapErrParameterInvalidMsg("validate analyzer failed for field: %s, name: %s, error: %v", info.GetField(), info.GetName(), err)), nil
+				return &querypb.ValidateAnalyzerResponse{Status: merr.Status(merr.WrapErrParameterInvalidMsg("validate analyzer failed for field: %s, name: %s, error: %v", info.GetField(), info.GetName(), err))}, nil
 			}
-			return merr.Status(merr.WrapErrParameterInvalidMsg("validate analyzer failed for field: %s, error: %v", info.GetField(), err)), nil
+			return &querypb.ValidateAnalyzerResponse{Status: merr.Status(merr.WrapErrParameterInvalidMsg("validate analyzer failed for field: %s, error: %v", info.GetField(), err))}, nil
 		}
 	}
 
-	return merr.Status(nil), nil
+	return &querypb.ValidateAnalyzerResponse{Status: merr.Status(nil)}, nil
 }
 
 type deleteRequestStringer struct {
@@ -1739,5 +1735,55 @@ func (node *QueryNode) DropIndex(ctx context.Context, req *querypb.DropIndexRequ
 		segment.DropIndex(ctx, indexID)
 	}
 
+	return merr.Success(), nil
+}
+
+func (node *QueryNode) GetHighlight(ctx context.Context, req *querypb.GetHighlightRequest) (*querypb.GetHighlightResponse, error) {
+	// check node healthy
+	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
+		return &querypb.GetHighlightResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+	defer node.lifetime.Done()
+
+	// get delegator
+	sd, ok := node.delegators.Get(req.GetChannel())
+	if !ok {
+		err := merr.WrapErrChannelNotFound(req.GetChannel())
+		log.Warn("GetHighlight failed, failed to get shard delegator", zap.Error(err))
+		return &querypb.GetHighlightResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	results, err := sd.GetHighlight(ctx, req)
+	if err != nil {
+		log.Warn("GetHighlight failed, delegator run failed", zap.Error(err))
+		return &querypb.GetHighlightResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	return &querypb.GetHighlightResponse{
+		Status:  merr.Success(),
+		Results: results,
+	}, nil
+}
+
+func (node *QueryNode) SyncFileResource(ctx context.Context, req *internalpb.SyncFileResourceRequest) (*commonpb.Status, error) {
+	log := log.Ctx(ctx).With(zap.Uint64("version", req.GetVersion()))
+	log.Info("sync file resource")
+
+	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
+		log.Warn("failed to sync file resource, QueryNode is not healthy")
+		return merr.Status(err), nil
+	}
+	defer node.lifetime.Done()
+
+	err := fileresource.Sync(req.GetResources())
+	if err != nil {
+		return merr.Status(err), nil
+	}
 	return merr.Success(), nil
 }

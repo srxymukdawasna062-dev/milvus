@@ -59,6 +59,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/kv"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util"
 	"github.com/milvus-io/milvus/pkg/v2/util/expr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
@@ -79,6 +80,8 @@ type Server struct {
 	tikvCli             *txnkv.Client
 	address             string
 	session             sessionutil.SessionInterface
+	sessionWatcher      sessionutil.SessionWatcher
+	sessionWatcherMu    sync.Mutex
 	kv                  kv.MetaKv
 	idAllocator         func() (int64, error)
 	metricsCacheManager *metricsinfo.MetricsCacheManager
@@ -109,11 +112,12 @@ type Server struct {
 	checkerController *checkers.CheckerController
 
 	// Observers
-	collectionObserver  *observers.CollectionObserver
-	targetObserver      *observers.TargetObserver
-	replicaObserver     *observers.ReplicaObserver
-	resourceObserver    *observers.ResourceObserver
-	leaderCacheObserver *observers.LeaderCacheObserver
+	collectionObserver   *observers.CollectionObserver
+	targetObserver       *observers.TargetObserver
+	replicaObserver      *observers.ReplicaObserver
+	resourceObserver     *observers.ResourceObserver
+	leaderCacheObserver  *observers.LeaderCacheObserver
+	fileResourceObserver *observers.FileResourceObserver
 
 	getBalancerFunc checkers.GetBalancerFunc
 	balancerMap     map[string]balance.Balance
@@ -162,7 +166,7 @@ func (s *Server) SetSession(session sessionutil.SessionInterface) error {
 }
 
 func (s *Server) ServerExist(serverID int64) bool {
-	sessions, _, err := s.session.GetSessions(typeutil.QueryNodeRole)
+	sessions, _, err := s.session.GetSessions(s.ctx, typeutil.QueryNodeRole)
 	if err != nil {
 		log.Ctx(s.ctx).Warn("failed to get sessions", zap.Error(err))
 		return false
@@ -291,6 +295,7 @@ func (s *Server) initQueryCoord() error {
 
 	// Init meta
 	s.nodeMgr = session.NewNodeManager()
+	s.nodeMgr.Start(s.ctx)
 	err = s.initMeta()
 	if err != nil {
 		return err
@@ -464,6 +469,8 @@ func (s *Server) initObserver() {
 	s.leaderCacheObserver = observers.NewLeaderCacheObserver(
 		s.proxyClientManager,
 	)
+
+	s.fileResourceObserver = observers.NewFileResourceObserver(s.ctx, s.nodeMgr, s.cluster)
 }
 
 func (s *Server) afterStart() {}
@@ -479,7 +486,7 @@ func (s *Server) Start() error {
 
 func (s *Server) startQueryCoord() error {
 	log.Ctx(s.ctx).Info("start watcher...")
-	sessions, revision, err := s.session.GetSessions(typeutil.QueryNodeRole)
+	sessions, revision, err := s.session.GetSessions(s.ctx, typeutil.QueryNodeRole)
 	if err != nil {
 		return err
 	}
@@ -527,6 +534,7 @@ func (s *Server) startServerLoop() {
 	s.targetObserver.Start()
 	s.replicaObserver.Start()
 	s.resourceObserver.Start()
+	s.fileResourceObserver.Start()
 
 	log.Info("start task scheduler...")
 	s.taskScheduler.Start()
@@ -582,6 +590,9 @@ func (s *Server) Stop() error {
 	if s.leaderCacheObserver != nil {
 		s.leaderCacheObserver.Stop()
 	}
+	if s.fileResourceObserver != nil {
+		s.fileResourceObserver.Stop()
+	}
 
 	if s.distController != nil {
 		log.Info("stop dist controller...")
@@ -593,12 +604,19 @@ func (s *Server) Stop() error {
 		s.cluster.Stop()
 	}
 
+	s.sessionWatcherMu.Lock()
+	if s.sessionWatcher != nil {
+		s.sessionWatcher.Stop()
+	}
+	s.sessionWatcherMu.Unlock()
+
+	s.cancel()
+	s.wg.Wait()
+
 	if s.session != nil {
 		s.session.Stop()
 	}
 
-	s.cancel()
-	s.wg.Wait()
 	log.Info("QueryCoord stop successfully")
 	return nil
 }
@@ -638,14 +656,16 @@ func (s *Server) watchNodes(revision int64) {
 	log := log.Ctx(s.ctx)
 	defer s.wg.Done()
 
-	eventChan := s.session.WatchServices(typeutil.QueryNodeRole, revision+1, s.rewatchNodes)
+	s.sessionWatcherMu.Lock()
+	s.sessionWatcher = s.session.WatchServices(typeutil.QueryNodeRole, revision+1, s.rewatchNodes)
+	s.sessionWatcherMu.Unlock()
 	for {
 		select {
 		case <-s.ctx.Done():
 			log.Info("stop watching nodes, QueryCoord stopped")
 			return
 
-		case event, ok := <-eventChan:
+		case event, ok := <-s.sessionWatcher.EventChannel():
 			if !ok {
 				// ErrCompacted is handled inside SessionWatcher
 				log.Warn("Session Watcher channel closed", zap.Int64("serverID", paramtable.GetNodeID()))
@@ -675,6 +695,7 @@ func (s *Server) watchNodes(revision int64) {
 					Labels:   event.Session.GetServerLabel(),
 				}))
 				s.handleNodeUp(nodeID)
+				s.fileResourceObserver.Notify()
 
 			case sessionutil.SessionUpdateEvent:
 				log.Info("stopping the node")
@@ -704,10 +725,14 @@ func (s *Server) rewatchNodes(sessions map[string]*sessionutil.Session) error {
 			// node in node manager but session not exist, means it's offline
 			s.nodeMgr.Remove(node.ID())
 			s.handleNodeDown(node.ID())
-		} else if nodeSession.Stopping && !node.IsStoppingState() {
-			// node in node manager but session is stopping, means it's stopping
-			s.nodeMgr.Stopping(node.ID())
-			s.handleNodeStopping(node.ID())
+		} else {
+			if nodeSession.Stopping && !node.IsStoppingState() {
+				// node in node manager but session is stopping, means it's stopping
+				log.Warn("rewatch found old querynode in stopping state", zap.Int64("nodeID", nodeSession.ServerID))
+				s.nodeMgr.Stopping(node.ID())
+				s.handleNodeStopping(node.ID())
+			}
+			delete(sessionMap, node.ID())
 		}
 	}
 
@@ -723,11 +748,14 @@ func (s *Server) rewatchNodes(sessions map[string]*sessionutil.Session) error {
 				Labels:   nodeSession.GetServerLabel(),
 			}))
 
+			// call handleNodeUp no matter what state new querynode is in
+			// all component need this op so that stopping balance could work correctly
+			s.handleNodeUp(nodeSession.GetServerID())
+
 			if nodeSession.Stopping {
+				log.Warn("rewatch found new querynode in stopping state", zap.Int64("nodeID", nodeSession.ServerID))
 				s.nodeMgr.Stopping(nodeSession.ServerID)
 				s.handleNodeStopping(nodeSession.ServerID)
-			} else {
-				s.handleNodeUp(nodeSession.GetServerID())
 			}
 		}
 	}
@@ -914,4 +942,9 @@ func (s *Server) watchLoadConfigChanges() {
 		s.applyLoadConfigChanges(s.ctx, int32(replicaNum), rgs)
 	})
 	paramtable.Get().Watch(paramtable.Get().QueryCoordCfg.ClusterLevelLoadResourceGroups.Key, rgHandler)
+}
+
+func (s *Server) SyncFileResource(ctx context.Context, resources []*internalpb.FileResourceInfo, version uint64) error {
+	s.fileResourceObserver.UpdateResources(resources, version)
+	return nil
 }

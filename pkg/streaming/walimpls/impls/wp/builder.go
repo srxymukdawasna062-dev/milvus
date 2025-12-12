@@ -102,6 +102,9 @@ func (b *builderImpl) setCustomWpConfig(wpConfig *config.Configuration, cfg *par
 	wpConfig.Woodpecker.Logstore.SegmentCompactionPolicy.MaxParallelReads = cfg.CompactionMaxParallelReads.GetAsInt()
 	wpConfig.Woodpecker.Logstore.SegmentReadPolicy.MaxBatchSize = cfg.ReaderMaxBatchSize.GetAsSize()
 	wpConfig.Woodpecker.Logstore.SegmentReadPolicy.MaxFetchThreads = cfg.ReaderMaxFetchThreads.GetAsInt()
+	wpConfig.Woodpecker.Logstore.RetentionPolicy.TTL = int(cfg.RetentionTTL.GetAsDurationByParse().Milliseconds() / 1000) // convert to seconds
+	wpConfig.Woodpecker.Logstore.FencePolicy.ConditionWrite = cfg.FencePolicyConditionWrite.GetValue()
+
 	// storage
 	wpConfig.Woodpecker.Storage.Type = cfg.StorageType.GetValue()
 

@@ -23,12 +23,27 @@
 #include "common/Consts.h"
 #include "boost/filesystem/path.hpp"
 #include "log/Log.h"
+#include "milvus-storage/properties.h"
 #include "storage/ChunkManager.h"
 #include "storage/Types.h"
 #include "milvus-storage/filesystem/fs.h"
 #include "filemanager/FileManager.h"
 
 namespace milvus::storage {
+
+// Normalize path to be consistent with Go's path.Join behavior.
+// This handles two issues:
+// 1. Removes leading "./" when root_path is "."
+// 2. Removes trailing "/." that lexically_normal() may produce
+inline std::string
+NormalizePath(const boost::filesystem::path& path) {
+    auto result = path.lexically_normal().string();
+    // Remove trailing "/." if present
+    if (result.size() >= 2 && result.substr(result.size() - 2) == "/.") {
+        result = result.substr(0, result.size() - 1);
+    }
+    return result;
+}
 
 struct FileManagerContext {
     FileManagerContext() : chunkManagerPtr(nullptr) {
@@ -61,12 +76,28 @@ struct FileManagerContext {
         plugin_context = context;
     }
 
+    /**
+     * @brief Set the loon FFI properties for storage access
+     *
+     * Configures the properties used for accessing loon storage through
+     * the FFI interface. These properties contain storage configuration
+     * such as endpoints, credentials, and connection settings.
+     *
+     * @param properties Shared pointer to Properties object
+     */
+    void
+    set_loon_ffi_properties(
+        std::shared_ptr<milvus_storage::api::Properties> properties) {
+        loon_ffi_properties = std::move(properties);
+    }
+
     FieldDataMeta fieldDataMeta;
     IndexMeta indexMeta;
     ChunkManagerPtr chunkManagerPtr;
     milvus_storage::ArrowFileSystemPtr fs;
     bool for_loading_index{false};
     std::shared_ptr<CPluginContext> plugin_context;
+    std::shared_ptr<milvus_storage::api::Properties> loon_ffi_properties;
 };
 
 #define FILEMANAGER_TRY try {
@@ -162,7 +193,7 @@ class FileManagerImpl : public milvus::FileManager {
             std::to_string(index_meta_.index_version) + "/" +
             std::to_string(field_meta_.partition_id) + "/" +
             std::to_string(field_meta_.segment_id);
-        return (prefix / path / path1).string();
+        return NormalizePath(prefix / path / path1);
     }
 
     virtual std::string
@@ -181,7 +212,7 @@ class FileManagerImpl : public milvus::FileManager {
         if (bucket.empty()) {
             return v1_prefix;
         } else {
-            return (bucket / v1_prefix).string();
+            return NormalizePath(bucket / v1_prefix);
         }
     }
 
@@ -196,7 +227,7 @@ class FileManagerImpl : public milvus::FileManager {
             std::to_string(field_meta_.partition_id) + "/" +
             std::to_string(field_meta_.segment_id) + "/" +
             std::to_string(field_meta_.field_id);
-        return (prefix / path / path1).string();
+        return NormalizePath(prefix / path / path1);
     }
 
  protected:
@@ -207,6 +238,7 @@ class FileManagerImpl : public milvus::FileManager {
     IndexMeta index_meta_;
     ChunkManagerPtr rcm_;
     milvus_storage::ArrowFileSystemPtr fs_;
+    std::shared_ptr<milvus_storage::api::Properties> loon_ffi_properties_;
     std::shared_ptr<CPluginContext> plugin_context_;
 };
 
